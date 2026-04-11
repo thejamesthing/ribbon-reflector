@@ -120,7 +120,10 @@ app.post('/api/checkout/membership', authRequired, (req, res) => {
 // ===== LISTINGS =====
 app.get('/api/listings', (req, res) => {
   const { q, city, max_price, sort, owner } = req.query;
-  let sql = `SELECT l.*, u.handle AS owner_handle FROM listings l JOIN users u ON u.id = l.owner_id WHERE l.status = 'active'`;
+  // When querying a specific owner, show all their listings (including pending/traded)
+  let sql = owner
+    ? `SELECT l.*, u.handle AS owner_handle FROM listings l JOIN users u ON u.id = l.owner_id WHERE 1=1`
+    : `SELECT l.*, u.handle AS owner_handle FROM listings l JOIN users u ON u.id = l.owner_id WHERE l.status = 'active'`;
   const params = [];
   if (q)         { sql += ' AND (l.artist LIKE ? OR l.venue LIKE ? OR l.city LIKE ?)'; const p = `%${q}%`; params.push(p,p,p); }
   if (city)      { sql += ' AND l.city = ?'; params.push(city); }
