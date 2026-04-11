@@ -56,7 +56,10 @@ function mockStripeRefund(chargeId, amountCents) {
 
 // ===== AUTH MIDDLEWARE =====
 function authRequired(req, res, next) {
-  const token = req.cookies.rr_token;
+  // Prefer Authorization header (works cross-origin, avoids cookie issues)
+  const authHeader = req.headers.authorization || '';
+  const headerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  const token = headerToken || req.cookies.rr_token;
   if (!token) return res.status(401).json({ error: 'not authenticated' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
@@ -72,14 +75,8 @@ function memberRequired(req, res, next) {
   if (!req.user.is_member) return res.status(402).json({ error: 'membership required', upgrade: '/api/checkout/membership' });
   next();
 }
-function setAuthCookie(res, userId) {
-  const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: '30d' });
-  res.cookie('rr_token', token, {
-    httpOnly: true,
-    sameSite: 'none',  // required for cross-origin (Vercel → Render)
-    secure: true,      // required when sameSite is 'none'
-    maxAge: 30*24*60*60*1000,
-  });
+function makeToken(userId) {
+  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: '30d' });
 }
 
 // ===== NOTIFICATIONS HELPER =====
@@ -98,8 +95,8 @@ app.post('/api/auth/signup', (req, res) => {
     const hash = bcrypt.hashSync(password, 10);
     const result = db.prepare('INSERT INTO users (handle, email, password_hash, bio) VALUES (?, ?, ?, ?)')
       .run(normHandle, email, hash, bio || '');
-    setAuthCookie(res, result.lastInsertRowid);
-    res.json({ id: result.lastInsertRowid, handle: normHandle, email, is_member: 0 });
+    const token = makeToken(result.lastInsertRowid);
+    res.json({ id: result.lastInsertRowid, handle: normHandle, email, is_member: 0, token });
   } catch (e) {
     if (e.message.includes('UNIQUE')) return res.status(409).json({ error: 'handle or email already taken' });
     res.status(500).json({ error: e.message });
@@ -112,8 +109,8 @@ app.post('/api/auth/login', (req, res) => {
   if (!user || !bcrypt.compareSync(password, user.password_hash)) {
     return res.status(401).json({ error: 'invalid credentials' });
   }
-  setAuthCookie(res, user.id);
-  res.json({ id: user.id, handle: user.handle, email: user.email, is_member: user.is_member, member_until: user.member_until });
+  const token = makeToken(user.id);
+  res.json({ id: user.id, handle: user.handle, email: user.email, is_member: user.is_member, member_until: user.member_until, token });
 });
 
 app.post('/api/auth/logout', (req, res) => {
