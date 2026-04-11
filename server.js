@@ -24,7 +24,21 @@ db.exec(schema);
 const app = express();
 app.use(express.json({ limit: '5mb' }));
 app.use(cookieParser());
-app.use(cors({ origin: true, credentials: true }));
+const ALLOWED_ORIGINS = [
+  'https://ribbon-reflector-frontend.vercel.app',
+  'http://localhost:3000',
+  'http://localhost:5173',
+];
+app.use(cors({
+  origin: (origin, cb) => {
+    // Allow same-origin/server-to-server (no origin header) and any vercel preview deployments
+    if (!origin || ALLOWED_ORIGINS.includes(origin) || /^https:\/\/ribbon-reflector-frontend.*\.vercel\.app$/.test(origin)) {
+      return cb(null, true);
+    }
+    cb(new Error('Not allowed by CORS: ' + origin));
+  },
+  credentials: true,
+}));
 
 // ===== MOCK STRIPE =====
 // In production, replace with real Stripe SDK calls.
@@ -60,7 +74,12 @@ function memberRequired(req, res, next) {
 }
 function setAuthCookie(res, userId) {
   const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: '30d' });
-  res.cookie('rr_token', token, { httpOnly: true, sameSite: 'lax', maxAge: 30*24*60*60*1000 });
+  res.cookie('rr_token', token, {
+    httpOnly: true,
+    sameSite: 'none',  // required for cross-origin (Vercel → Render)
+    secure: true,      // required when sameSite is 'none'
+    maxAge: 30*24*60*60*1000,
+  });
 }
 
 // ===== NOTIFICATIONS HELPER =====
@@ -361,6 +380,19 @@ app.post('/api/notifications/read-all', authRequired, (req, res) => {
 app.post('/api/notifications/:id/read', authRequired, (req, res) => {
   db.prepare('UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?').run(req.params.id, req.user.id);
   res.json({ ok: true });
+});
+
+// ===== DEV ONLY — remove before production =====
+// Delete a user by email so you can retry signup after a failed attempt.
+// Protected by a secret header so random internet can't call it.
+app.post('/api/dev/delete-user', (req, res) => {
+  if (req.headers['x-dev-secret'] !== (process.env.JWT_SECRET || 'dev-secret-change-in-production')) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'email required' });
+  const result = db.prepare('DELETE FROM users WHERE email = ?').run(email);
+  res.json({ deleted: result.changes });
 });
 
 // ===== HEALTH =====
