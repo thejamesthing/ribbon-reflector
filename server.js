@@ -17,9 +17,26 @@ const MEMBERSHIP_CENTS = 1000; // $10.00
 const db = new Database(path.join(__dirname, 'data.db'));
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+
+// ===== ONE-TIME MIGRATION: swap-mode offers → cash-mode offers =====
+// The old `offers` table has `offered_listing_id NOT NULL` and no `amount_cents` column.
+// Detect the old shape and drop the table so schema.sql recreates it below.
+// Safe to leave this block in place after migration — it's a no-op on the new shape.
+// REMOVE this block after confirming migration has run on all environments.
+try {
+  const cols = db.prepare("PRAGMA table_info(offers)").all();
+  const hasOldShape = cols.some(c => c.name === 'offered_listing_id');
+  const hasNewShape = cols.some(c => c.name === 'amount_cents');
+  if (hasOldShape && !hasNewShape) {
+    console.log('[migration] Dropping old swap-mode offers table. Existing offer rows will be lost.');
+    db.exec('DROP TABLE IF EXISTS offers;');
+  }
+} catch (e) {
+  console.error('[migration] offers table check failed:', e.message);
+}
+
 const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
 db.exec(schema);
-
 // ===== APP =====
 const app = express();
 app.use(express.json({ limit: '5mb' }));

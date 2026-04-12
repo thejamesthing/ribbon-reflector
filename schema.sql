@@ -33,16 +33,21 @@ CREATE INDEX IF NOT EXISTS idx_listings_status ON listings(status);
 CREATE INDEX IF NOT EXISTS idx_listings_artist ON listings(artist);
 CREATE INDEX IF NOT EXISTS idx_listings_owner ON listings(owner_id);
 
+-- offers: cash-only, one-directional. Buyer offers amount_cents up to target listing's face_value.
+-- amount_cents is authoritative; frontend converts to/from dollars for display.
 CREATE TABLE IF NOT EXISTS offers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   from_user_id INTEGER NOT NULL REFERENCES users(id),
   to_user_id INTEGER NOT NULL REFERENCES users(id),
   target_listing_id INTEGER NOT NULL REFERENCES listings(id),
-  offered_listing_id INTEGER NOT NULL REFERENCES listings(id),
+  amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
   note TEXT,
   status TEXT DEFAULT 'pending', -- pending | accepted | declined | withdrawn
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_offers_to ON offers(to_user_id, status);
+CREATE INDEX IF NOT EXISTS idx_offers_from ON offers(from_user_id, status);
+CREATE INDEX IF NOT EXISTS idx_offers_target ON offers(target_listing_id, status);
 CREATE INDEX IF NOT EXISTS idx_offers_to ON offers(to_user_id, status);
 CREATE INDEX IF NOT EXISTS idx_offers_from ON offers(from_user_id, status);
 
