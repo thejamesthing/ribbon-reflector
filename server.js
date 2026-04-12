@@ -213,18 +213,41 @@ app.get('/api/users/:handle', (req, res) => {
   res.json({ user, listings, reviews, trust_score: avgRow.n ? Math.round((avgRow.avg/5)*100) : 0, reviews_count: avgRow.n });
 });
 
-// ===== OFFERS (two-sided) =====
+// ===== OFFERS (cash-only, one-directional) =====
+// Buyer makes a cash offer from $0.01 up to (never above) the target listing's face_value.
+// amount_cents is authoritative and enforced server-side; frontend cap is a courtesy only.
 app.post('/api/offers', authRequired, memberRequired, (req, res) => {
-  const { target_listing_id, offered_listing_id, note } = req.body;
+  const { target_listing_id, amount_cents, note } = req.body;
+
+  // Coerce and validate amount_cents — must be a positive integer.
+  const amt = Number.parseInt(amount_cents, 10);
+  if (!Number.isFinite(amt) || amt <= 0) {
+    return res.status(400).json({ error: 'amount_cents must be a positive integer' });
+  }
+
   const target = db.prepare('SELECT * FROM listings WHERE id=?').get(target_listing_id);
-  const offered = db.prepare('SELECT * FROM listings WHERE id=?').get(offered_listing_id);
-  if (!target || !offered) return res.status(404).json({ error: 'listing not found' });
+  if (!target) return res.status(404).json({ error: 'listing not found' });
   if (target.owner_id === req.user.id) return res.status(400).json({ error: 'cannot offer on your own listing' });
-  if (offered.owner_id !== req.user.id) return res.status(403).json({ error: 'you do not own the offered listing' });
-  if (offered.status !== 'active' && offered.status !== 'pending') return res.status(400).json({ error: 'offered listing is not available' });
-  const result = db.prepare(`INSERT INTO offers (from_user_id, to_user_id, target_listing_id, offered_listing_id, note) VALUES (?,?,?,?,?)`)
-    .run(req.user.id, target.owner_id, target_listing_id, offered_listing_id, note || '');
-  notify(target.owner_id, '🎟️', `<strong>${req.user.handle}</strong> sent you an offer for ${target.artist}.`, 'myTickets', { tab: 'incoming' });
+  if (target.status !== 'active') return res.status(400).json({ error: 'listing is not available' });
+
+  // Hard cap: offer cannot exceed face value. Face value is stored as REAL dollars;
+  // convert to cents with rounding to avoid float drift (e.g. 49.99 → 4999).
+  const faceCents = Math.round(Number(target.face_value) * 100);
+  if (amt > faceCents) {
+    return res.status(400).json({ error: `offer cannot exceed face value ($${(faceCents/100).toFixed(2)})` });
+  }
+
+  const result = db.prepare(
+    `INSERT INTO offers (from_user_id, to_user_id, target_listing_id, amount_cents, note) VALUES (?,?,?,?,?)`
+  ).run(req.user.id, target.owner_id, target_listing_id, amt, note || '');
+
+  notify(
+    target.owner_id,
+    '🎟️',
+    `<strong>${req.user.handle}</strong> offered $${(amt/100).toFixed(2)} for your ${target.artist} ticket.`,
+    'myTickets',
+    { tab: 'incoming' }
+  );
   res.json({ id: result.lastInsertRowid });
 });
 
