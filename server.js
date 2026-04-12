@@ -14,7 +14,12 @@ const PORT = process.env.PORT || 3001;
 const MEMBERSHIP_CENTS = 1000; // $10.00
 
 // ===== DB SETUP =====
-const db = new Database(path.join(__dirname, 'data.db'));
+// Use the mounted persistent disk in production; fall back to local file for dev.
+// DB_PATH env var lets us override, but sane defaults: /var/data/data.db on Render (persistent disk),
+// ./data.db locally.
+const DB_DIR = fs.existsSync('/var/data') ? '/var/data' : __dirname;
+const db = new Database(path.join(DB_DIR, 'data.db'));
+console.log('[db] Using SQLite file at', path.join(DB_DIR, 'data.db'));
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
