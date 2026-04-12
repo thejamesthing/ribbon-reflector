@@ -252,13 +252,20 @@ app.post('/api/offers', authRequired, memberRequired, (req, res) => {
 });
 
 app.get('/api/offers/incoming', authRequired, (req, res) => {
-  res.json(db.prepare(`SELECT o.*, u.handle AS from_handle,
-    tl.artist AS target_artist, tl.venue AS target_venue, tl.event_date AS target_date,
-    ol.artist AS offered_artist, ol.venue AS offered_venue, ol.event_date AS offered_date, ol.seat AS offered_seat, ol.face_value AS offered_face
-    FROM offers o JOIN users u ON u.id=o.from_user_id
+  // Cash-mode incoming offers: only pending offers on listings owned by the caller.
+  // Returns everything the seller needs to display the offer and decide accept/decline.
+  // No join to an "offered listing" — there isn't one under cash-mode.
+  res.json(db.prepare(`SELECT
+      o.id, o.amount_cents, o.note, o.status, o.created_at,
+      o.from_user_id, u.handle AS from_handle,
+      o.target_listing_id,
+      tl.artist AS target_artist, tl.venue AS target_venue, tl.city AS target_city,
+      tl.event_date AS target_date, tl.seat AS target_seat, tl.face_value AS target_face_value
+    FROM offers o
+    JOIN users u ON u.id=o.from_user_id
     JOIN listings tl ON tl.id=o.target_listing_id
-    JOIN listings ol ON ol.id=o.offered_listing_id
-    WHERE o.to_user_id=? AND o.status='pending' ORDER BY o.created_at DESC`).all(req.user.id));
+    WHERE o.to_user_id=? AND o.status='pending'
+    ORDER BY o.created_at DESC`).all(req.user.id));
 });
 
 app.get('/api/offers/outgoing', authRequired, (req, res) => {
