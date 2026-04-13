@@ -69,6 +69,20 @@ db.exec(schema);
     }
   }
 }
+// ===== EMAIL VERIFICATION COLUMN MIGRATION (Step 9a) =====
+{
+  const have = new Set(db.prepare("PRAGMA table_info(users)").all().map(c => c.name));
+  for (const [col, type] of [
+    ['email_verified', 'INTEGER NOT NULL DEFAULT 0'],
+    ['email_verification_token', 'TEXT'],
+    ['email_verification_sent_at', 'TIMESTAMP'],
+  ]) {
+    if (!have.has(col)) {
+      console.log('[migration] users: adding column', col);
+      db.exec(`ALTER TABLE users ADD COLUMN ${col} ${type}`);
+    }
+  }
+}
 // ===== APP =====
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -112,7 +126,7 @@ function authRequired(req, res, next) {
   if (!token) return res.status(401).json({ error: 'not authenticated' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT id, handle, email, is_member, member_until, bio, avatar_data_url, link, city, region FROM users WHERE id = ?').get(payload.userId);
+    const user = db.prepare('SELECT id, handle, email, is_member, member_until, bio, avatar_data_url, link, city, region, email_verified, email_verification_sent_at FROM users WHERE id = ?').get(payload.userId);
     if (!user) return res.status(401).json({ error: 'user not found' });
     req.user = user;
     next();
@@ -128,6 +142,58 @@ function makeToken(userId) {
   return jwt.sign({ userId }, JWT_SECRET, { expiresIn: '30d' });
 }
 
+// ===== EMAIL (Step 9a) =====
+const crypto = require('crypto');
+const { Resend } = require('resend');
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const FROM_EMAIL = process.env.FROM_EMAIL || 'Ribbon Reflector <team@ribbonreflector.com>';
+const FRONTEND_URL = (process.env.FRONTEND_URL || 'https://ribbon-reflector-frontend.vercel.app').replace(/\/$/, '');
+const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+if (!resend) console.warn('[email] RESEND_API_KEY not set — emails will be logged to console only.');
+
+async function sendEmail({ to, subject, html, text }) {
+  if (!resend) {
+    console.log('[email DEV MODE]');
+    console.log('  to:', to);
+    console.log('  subject:', subject);
+    console.log('  text:', text);
+    return { dev: true };
+  }
+  try {
+    return await resend.emails.send({ from: FROM_EMAIL, to, subject, html, text });
+  } catch (e) {
+    console.error('[email] send failed:', e.message);
+    throw e;
+  }
+}
+
+function sendVerificationEmail(user, token) {
+  const url = `${FRONTEND_URL}/?verify=${encodeURIComponent(token)}`;
+  return sendEmail({
+    to: user.email,
+    subject: 'Verify your email — Ribbon Reflector',
+    text: `Hi ${user.handle},\n\nConfirm your email to start trading tickets on Ribbon Reflector:\n\n${url}\n\nThis link expires in 24 hours. If you didn't sign up, ignore this email.\n\n— Ribbon Reflector`,
+    html: `<div style="font-family:-apple-system,Segoe UI,sans-serif;max-width:520px;margin:0 auto;padding:24px;color:#1a1a1a">
+      <h2 style="margin:0 0 14px">Welcome to Ribbon Reflector</h2>
+      <p>Hi ${user.handle},</p>
+      <p>Confirm your email address to start trading tickets with other fans.</p>
+      <p style="margin:24px 0"><a href="${url}" style="display:inline-block;background:#1a1a1a;color:#fff;padding:12px 22px;border-radius:8px;text-decoration:none;font-weight:600">Verify email</a></p>
+      <p style="color:#666;font-size:13px">Or paste this link into your browser:<br><span style="color:#999">${url}</span></p>
+      <p style="color:#666;font-size:13px;margin-top:20px">This link expires in 24 hours. If you didn't sign up, ignore this email.</p>
+      <p style="color:#999;font-size:12px;margin-top:24px;border-top:1px solid #eee;padding-top:12px">— Ribbon Reflector</p>
+    </div>`,
+  });
+}
+
+// Middleware: returns 403 until the user has verified their email.
+function verifiedRequired(req, res, next) {
+  if (!req.user?.email_verified) {
+    return res.status(403).json({ error: 'email verification required', needs_verification: true });
+  }
+  next();
+}
+
+
 function authOptional(req, res, next) {
   const authHeader = req.headers.authorization || '';
   const headerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
@@ -135,7 +201,7 @@ function authOptional(req, res, next) {
   if (!token) return next();
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT id, handle, email, is_member, member_until, bio, avatar_data_url, link, city, region FROM users WHERE id = ?').get(payload.userId);
+    const user = db.prepare('SELECT id, handle, email, is_member, member_until, bio, avatar_data_url, link, city, region, email_verified, email_verification_sent_at FROM users WHERE id = ?').get(payload.userId);
     if (user) req.user = user;
   } catch {}
   next();
@@ -148,21 +214,67 @@ function notify(userId, icon, text, route, params) {
 }
 
 // ===== AUTH =====
-app.post('/api/auth/signup', (req, res) => {
+app.post('/api/auth/signup', async (req, res) => {
   const { handle, email, password, bio } = req.body;
   if (!handle || !email || !password) return res.status(400).json({ error: 'missing fields' });
   if (password.length < 8) return res.status(400).json({ error: 'password must be at least 8 chars' });
   const normHandle = handle.startsWith('@') ? handle : '@' + handle;
+  let userId, verificationToken;
   try {
     const hash = bcrypt.hashSync(password, 10);
-    const result = db.prepare('INSERT INTO users (handle, email, password_hash, bio) VALUES (?, ?, ?, ?)')
-      .run(normHandle, email, hash, bio || '');
-    const token = makeToken(result.lastInsertRowid);
-    res.json({ id: result.lastInsertRowid, handle: normHandle, email, is_member: 0, token });
+    verificationToken = crypto.randomBytes(32).toString('hex');
+    const result = db.prepare(`INSERT INTO users (handle, email, password_hash, bio, email_verification_token, email_verification_sent_at)
+      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`)
+      .run(normHandle, email, hash, bio || '', verificationToken);
+    userId = result.lastInsertRowid;
   } catch (e) {
     if (e.message.includes('UNIQUE')) return res.status(409).json({ error: 'handle or email already taken' });
-    res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: e.message });
   }
+  // Fire-and-log: if the email fails we still return success; user can resend later.
+  try { await sendVerificationEmail({ handle: normHandle, email }, verificationToken); }
+  catch (e) { console.error('[signup] verification email failed:', e.message); }
+  const token = makeToken(userId);
+  res.json({ id: userId, handle: normHandle, email, is_member: 0, email_verified: 0, token });
+});
+
+// Confirm ownership of the email address via the token sent at signup.
+// Public (no auth required) — the token itself is the credential.
+app.post('/api/auth/verify-email/:token', (req, res) => {
+  const token = req.params.token;
+  const user = db.prepare('SELECT * FROM users WHERE email_verification_token=?').get(token);
+  if (!user) return res.status(404).json({ error: 'invalid or expired verification link' });
+  if (user.email_verified) {
+    // Already verified — treat as idempotent success.
+    return res.json({ ok: true, handle: user.handle, already: true });
+  }
+  // 24-hour window on the token.
+  if (user.email_verification_sent_at) {
+    const sentMs = Date.parse(user.email_verification_sent_at + 'Z');
+    if (Number.isFinite(sentMs) && Date.now() - sentMs > 24 * 60 * 60 * 1000) {
+      return res.status(410).json({ error: 'verification link expired — request a new one' });
+    }
+  }
+  db.prepare('UPDATE users SET email_verified=1, email_verification_token=NULL WHERE id=?').run(user.id);
+  notify(user.id, '✓', 'Email verified — you can now list tickets and make offers.', 'home');
+  res.json({ ok: true, handle: user.handle });
+});
+
+// Request a fresh verification email. Auth required; 60-second cooldown per user.
+app.post('/api/auth/resend-verification', authRequired, async (req, res) => {
+  if (req.user.email_verified) return res.json({ ok: true, already_verified: true });
+  if (req.user.email_verification_sent_at) {
+    const sentMs = Date.parse(req.user.email_verification_sent_at + 'Z');
+    if (Number.isFinite(sentMs) && Date.now() - sentMs < 60 * 1000) {
+      return res.status(429).json({ error: 'please wait a minute before requesting another email' });
+    }
+  }
+  const token = crypto.randomBytes(32).toString('hex');
+  db.prepare('UPDATE users SET email_verification_token=?, email_verification_sent_at=CURRENT_TIMESTAMP WHERE id=?')
+    .run(token, req.user.id);
+  try { await sendVerificationEmail(req.user, token); }
+  catch (e) { return res.status(500).json({ error: 'could not send email: ' + e.message }); }
+  res.json({ ok: true });
 });
 
 app.post('/api/auth/login', (req, res) => {
@@ -172,7 +284,7 @@ app.post('/api/auth/login', (req, res) => {
     return res.status(401).json({ error: 'invalid credentials' });
   }
   const token = makeToken(user.id);
-  res.json({ id: user.id, handle: user.handle, email: user.email, is_member: user.is_member, member_until: user.member_until, token });
+  res.json({ id: user.id, handle: user.handle, email: user.email, is_member: user.is_member, member_until: user.member_until, email_verified: user.email_verified, token });
 });
 
 app.post('/api/auth/logout', (req, res) => {
@@ -184,7 +296,7 @@ app.get('/api/me', authRequired, (req, res) => res.json(req.user));
 
 // Update profile fields. All fields are optional; pass only the ones to change.
 // Avatar is sent as a base64 data URL string; client should resize before posting.
-app.patch('/api/me', authRequired, (req, res) => {
+app.patch('/api/me', authRequired, verifiedRequired, (req, res) => {
   const { bio, link, city, region, avatar_data_url } = req.body;
   if (avatar_data_url != null && typeof avatar_data_url === 'string' && avatar_data_url.length > 2_000_000) {
     return res.status(413).json({ error: 'avatar too large — please use a smaller image' });
@@ -245,7 +357,7 @@ app.get('/api/listings/:id', (req, res) => {
   res.json(row);
 });
 
-app.post('/api/listings', authRequired, memberRequired, (req, res) => {
+app.post('/api/listings', authRequired, memberRequired, verifiedRequired, (req, res) => {
   const { artist, venue, city, event_date, seat, qty, face_value, source, notes, receipt_filename } = req.body;
   if (!artist || !venue || !face_value) return res.status(400).json({ error: 'artist, venue, face_value required' });
   if (!receipt_filename) return res.status(400).json({ error: 'face-value receipt required' });
@@ -306,7 +418,7 @@ app.get('/api/users/:handle', authOptional, (req, res) => {
 // ===== OFFERS (cash-only, one-directional) =====
 // Buyer makes a cash offer from $0.01 up to (never above) the target listing's face_value.
 // amount_cents is authoritative and enforced server-side; frontend cap is a courtesy only.
-app.post('/api/offers', authRequired, memberRequired, (req, res) => {
+app.post('/api/offers', authRequired, memberRequired, verifiedRequired, (req, res) => {
   const { target_listing_id, amount_cents, note } = req.body;
 
   // Coerce and validate amount_cents — must be a positive integer.
@@ -368,7 +480,7 @@ app.get('/api/offers/outgoing', authRequired, (req, res) => {
 
 // Accept an offer (cash-mode): charge buyer for amount_cents, create trade, mark listing traded, auto-decline siblings.
 // Seller is the acceptor (offer.to_user_id); buyer is offer.from_user_id.
-app.post('/api/offers/:id/accept', authRequired, (req, res) => {
+app.post('/api/offers/:id/accept', authRequired, verifiedRequired, (req, res) => {
   const offer = db.prepare('SELECT * FROM offers WHERE id=?').get(req.params.id);
   if (!offer) return res.status(404).json({ error: 'not found' });
   if (offer.to_user_id !== req.user.id) return res.status(403).json({ error: 'not your offer to accept' });
@@ -537,7 +649,7 @@ app.post('/api/trades/:id/dispute', authRequired, (req, res) => {
 });
 
 // ===== REVIEWS =====
-app.post('/api/reviews', authRequired, (req, res) => {
+app.post('/api/reviews', authRequired, verifiedRequired, (req, res) => {
   const { trade_id, stars, body } = req.body;
   if (!trade_id || !stars) return res.status(400).json({ error: 'trade_id and stars required' });
   const starsInt = Number.parseInt(stars, 10);
@@ -574,7 +686,7 @@ app.get('/api/friends', authRequired, (req, res) => {
   res.json({ friends, incoming, outgoing });
 });
 
-app.post('/api/friends/:handle', authRequired, (req, res) => {
+app.post('/api/friends/:handle', authRequired, verifiedRequired, (req, res) => {
   const handle = req.params.handle.startsWith('@') ? req.params.handle : '@' + req.params.handle;
   const target = db.prepare('SELECT id, handle FROM users WHERE handle=?').get(handle);
   if (!target) return res.status(404).json({ error: 'user not found' });
