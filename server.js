@@ -751,10 +751,15 @@ app.get('/api/offers/incoming', authRequired, (req, res) => {
 });
 
 app.get('/api/offers/outgoing', authRequired, (req, res) => {
+  // Left-join trades so that accepted offers carry the trade_id + payment_status the buyer
+  // needs to jump to the payment flow.
   res.json(db.prepare(`SELECT o.*, u.handle AS to_handle,
-    tl.artist AS target_artist, tl.venue AS target_venue
-    FROM offers o JOIN users u ON u.id=o.to_user_id
+    tl.artist AS target_artist, tl.venue AS target_venue,
+    t.id AS trade_id, t.payment_status AS trade_payment_status
+    FROM offers o
+    JOIN users u ON u.id=o.to_user_id
     JOIN listings tl ON tl.id=o.target_listing_id
+    LEFT JOIN trades t ON t.offer_id=o.id
     WHERE o.from_user_id=? ORDER BY o.created_at DESC`).all(req.user.id));
 });
 
