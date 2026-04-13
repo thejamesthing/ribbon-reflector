@@ -58,6 +58,17 @@ try {
 
 const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
 db.exec(schema);
+// ===== PROFILE COLUMN MIGRATION (Step 8a) =====
+// SQLite has no ADD COLUMN IF NOT EXISTS, so introspect first and add what's missing.
+{
+  const have = new Set(db.prepare("PRAGMA table_info(users)").all().map(c => c.name));
+  for (const [col, type] of [['avatar_data_url','TEXT'],['link','TEXT'],['city','TEXT'],['region','TEXT']]) {
+    if (!have.has(col)) {
+      console.log('[migration] users: adding column', col);
+      db.exec(`ALTER TABLE users ADD COLUMN ${col} ${type}`);
+    }
+  }
+}
 // ===== APP =====
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -101,7 +112,7 @@ function authRequired(req, res, next) {
   if (!token) return res.status(401).json({ error: 'not authenticated' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT id, handle, email, is_member, member_until, bio FROM users WHERE id = ?').get(payload.userId);
+    const user = db.prepare('SELECT id, handle, email, is_member, member_until, bio, avatar_data_url, link, city, region FROM users WHERE id = ?').get(payload.userId);
     if (!user) return res.status(401).json({ error: 'user not found' });
     req.user = user;
     next();
@@ -124,7 +135,7 @@ function authOptional(req, res, next) {
   if (!token) return next();
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT id, handle, email, is_member, member_until, bio FROM users WHERE id = ?').get(payload.userId);
+    const user = db.prepare('SELECT id, handle, email, is_member, member_until, bio, avatar_data_url, link, city, region FROM users WHERE id = ?').get(payload.userId);
     if (user) req.user = user;
   } catch {}
   next();
@@ -170,6 +181,30 @@ app.post('/api/auth/logout', (req, res) => {
 });
 
 app.get('/api/me', authRequired, (req, res) => res.json(req.user));
+
+// Update profile fields. All fields are optional; pass only the ones to change.
+// Avatar is sent as a base64 data URL string; client should resize before posting.
+app.patch('/api/me', authRequired, (req, res) => {
+  const { bio, link, city, region, avatar_data_url } = req.body;
+  if (avatar_data_url != null && typeof avatar_data_url === 'string' && avatar_data_url.length > 2_000_000) {
+    return res.status(413).json({ error: 'avatar too large — please use a smaller image' });
+  }
+  if (link != null && typeof link === 'string' && link.length > 200) {
+    return res.status(400).json({ error: 'link too long (200 char max)' });
+  }
+  if (bio != null && typeof bio === 'string' && bio.length > 500) {
+    return res.status(400).json({ error: 'bio too long (500 char max)' });
+  }
+  const fields = [], values = [];
+  for (const [k, v] of Object.entries({ bio, link, city, region, avatar_data_url })) {
+    if (v !== undefined) { fields.push(`${k}=?`); values.push(v === '' ? null : v); }
+  }
+  if (!fields.length) return res.status(400).json({ error: 'no fields to update' });
+  values.push(req.user.id);
+  db.prepare(`UPDATE users SET ${fields.join(', ')} WHERE id=?`).run(...values);
+  const updated = db.prepare('SELECT id, handle, email, is_member, member_until, bio, avatar_data_url, link, city, region FROM users WHERE id=?').get(req.user.id);
+  res.json(updated);
+});
 
 // ===== MEMBERSHIP CHECKOUT =====
 app.post('/api/checkout/membership', authRequired, (req, res) => {
@@ -239,7 +274,7 @@ app.get('/api/events/:key', (req, res) => {
 // ===== USER PROFILES =====
 app.get('/api/users/:handle', authOptional, (req, res) => {
   const handle = req.params.handle.startsWith('@') ? req.params.handle : '@' + req.params.handle;
-  const user = db.prepare('SELECT id, handle, bio, created_at FROM users WHERE handle = ?').get(handle);
+  const user = db.prepare('SELECT id, handle, bio, avatar_data_url, link, city, region, created_at FROM users WHERE handle = ?').get(handle);
   if (!user) return res.status(404).json({ error: 'not found' });
   const listings = db.prepare(`SELECT * FROM listings WHERE owner_id=? AND status='active'`).all(user.id);
   const reviews = db.prepare(`SELECT r.*, u.handle AS author_handle FROM reviews r JOIN users u ON u.id=r.author_id WHERE r.subject_id=? ORDER BY r.created_at DESC`).all(user.id);
