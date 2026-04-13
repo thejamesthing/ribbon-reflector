@@ -109,6 +109,26 @@ db.exec(schema);
     }
   }
 }
+// ===== PAYMENT INTENT COLUMN MIGRATION (Phase 2) =====
+// payment_status lifecycle:
+//   'pending'  → PI authorized, buyer hasn't paid yet
+//   'paid'     → PI captured, funds held by platform
+//   'failed'   → card declined / auth failed
+//   'canceled' → buyer canceled or window expired
+{
+  const have = new Set(db.prepare("PRAGMA table_info(trades)").all().map(c => c.name));
+  for (const [col, type] of [
+    ['payment_intent_id', 'TEXT'],
+    ['payment_status', "TEXT NOT NULL DEFAULT 'pending'"],
+    ['payment_window_expires_at', 'TIMESTAMP'],
+    ['payment_client_secret', 'TEXT'],
+  ]) {
+    if (!have.has(col)) {
+      console.log('[migration] trades: adding column', col);
+      db.exec(`ALTER TABLE trades ADD COLUMN ${col} ${type}`);
+    }
+  }
+}
 // ===== APP =====
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -296,6 +316,46 @@ function deriveStripeStatus(account) {
   if (!account) return 'none';
   if (account.charges_enabled && account.payouts_enabled && account.details_submitted) return 'enabled';
   return 'pending';
+}
+
+// ===== PAYMENT LIFECYCLE HELPERS (Phase 2) =====
+// Returns true if the trade's payment window has expired.
+function isPaymentExpired(trade) {
+  if (!trade.payment_window_expires_at) return false;
+  const exp = Date.parse(trade.payment_window_expires_at);
+  return Number.isFinite(exp) && Date.now() > exp;
+}
+
+// Called lazily on trade fetch. If payment window has expired while trade is still
+// 'pending', void the PaymentIntent and mark the trade canceled. Idempotent.
+async function sweepExpiredPayment(tradeId) {
+  const t = db.prepare('SELECT * FROM trades WHERE id=?').get(tradeId);
+  if (!t) return;
+  if (t.payment_status !== 'pending' || !isPaymentExpired(t)) return;
+  console.log(`[payment-sweep] trade ${t.id} payment window expired — canceling`);
+  if (stripe && t.payment_intent_id) {
+    try { await stripe.paymentIntents.cancel(t.payment_intent_id); }
+    catch (e) { console.error('[payment-sweep] PI cancel failed:', e.message); }
+  }
+  const tx = db.transaction(() => {
+    db.prepare(`UPDATE trades SET payment_status='canceled', status='canceled' WHERE id=?`).run(t.id);
+    // Return listing to active so seller can sell to someone else.
+    db.prepare(`UPDATE listings SET status='active' WHERE id=?`).run(t.listing_id);
+  });
+  tx();
+  notify(t.buyer_id,  '⏰', 'Your payment window expired — offer canceled.', 'myTickets', { tab:'outgoing' });
+  notify(t.seller_id, '⏰', 'Buyer didn\'t complete payment in time — your listing is live again.', 'myTickets');
+}
+
+// Gate on mark-sent: seller can't mark sent until buyer has actually paid (PI captured).
+function paidRequired(req, res, next) {
+  // We only have trade.id at this middleware site; fetch it.
+  const trade = db.prepare('SELECT payment_status FROM trades WHERE id=?').get(req.params.id);
+  if (!trade) return res.status(404).json({ error: 'trade not found' });
+  if (trade.payment_status !== 'paid') {
+    return res.status(402).json({ error: 'waiting for buyer payment', payment_status: trade.payment_status });
+  }
+  next();
 }
 
 // Middleware: returns 403 until the user has verified their email.
@@ -700,7 +760,7 @@ app.get('/api/offers/outgoing', authRequired, (req, res) => {
 
 // Accept an offer (cash-mode): charge buyer for amount_cents, create trade, mark listing traded, auto-decline siblings.
 // Seller is the acceptor (offer.to_user_id); buyer is offer.from_user_id.
-app.post('/api/offers/:id/accept', authRequired, verifiedRequired, payoutsRequired, (req, res) => {
+app.post('/api/offers/:id/accept', authRequired, verifiedRequired, payoutsRequired, async (req, res) => {
   const offer = db.prepare('SELECT * FROM offers WHERE id=?').get(req.params.id);
   if (!offer) return res.status(404).json({ error: 'not found' });
   if (offer.to_user_id !== req.user.id) return res.status(403).json({ error: 'not your offer to accept' });
@@ -720,15 +780,15 @@ app.post('/api/offers/:id/accept', authRequired, verifiedRequired, payoutsRequir
   const tx = db.transaction(() => {
     db.prepare(`UPDATE offers SET status='accepted' WHERE id=?`).run(offer.id);
 
+    // Phase 2: no payment row here yet — we create a PaymentIntent below, after the transaction.
+    // Trade starts in payment_status='pending'; listing is 'traded' but will flip back to 'active'
+    // if the buyer doesn't pay within the 15-minute window (see sweepExpiredPayment).
     const tradeResult = db.prepare(`INSERT INTO trades
-      (offer_id, buyer_id, seller_id, listing_id, amount_cents, escrow_charge_id)
-      VALUES (?,?,?,?,?,?)`)
-      .run(offer.id, buyerId, sellerId, listing.id, amountCents, charge.id);
+      (offer_id, buyer_id, seller_id, listing_id, amount_cents, escrow_charge_id, payment_status)
+      VALUES (?,?,?,?,?,?,'pending')`)
+      .run(offer.id, buyerId, sellerId, listing.id, amountCents, '');
 
     db.prepare(`UPDATE listings SET status='traded' WHERE id=?`).run(listing.id);
-
-    db.prepare(`INSERT INTO payments (user_id, kind, amount_cents, stripe_id, trade_id) VALUES (?, 'escrow_hold', ?, ?, ?)`)
-      .run(buyerId, amountCents, charge.id, tradeResult.lastInsertRowid);
 
     // Auto-decline all other pending offers on this listing — one winner per listing.
     const siblings = db.prepare(`SELECT id, from_user_id FROM offers WHERE target_listing_id=? AND status='pending' AND id != ?`)
@@ -744,6 +804,33 @@ app.post('/api/offers/:id/accept', authRequired, verifiedRequired, payoutsRequir
 
   const buyerHandle = db.prepare('SELECT handle FROM users WHERE id=?').get(buyerId).handle;
   const amountDisplay = `$${(amountCents/100).toFixed(2)}`;
+
+  // Phase 2: create a real PaymentIntent — authorizes now, captures automatically on success.
+  // TODO Phase 3: switch capture_method to 'manual' once transfer-on-complete is wired.
+  let pi = null;
+  try {
+    pi = await stripe.paymentIntents.create({
+      amount: amountCents,
+      currency: 'usd',
+      capture_method: 'automatic',
+      metadata: {
+        rr_trade_id: String(tradeId),
+        rr_buyer_id: String(buyerId),
+        rr_seller_id: String(sellerId),
+        rr_listing_id: String(listing.id),
+      },
+      automatic_payment_methods: { enabled: true },
+    });
+  } catch (e) {
+    console.error('[accept] PaymentIntent create failed:', e.message);
+    db.prepare(`UPDATE trades SET payment_status='failed', status='canceled' WHERE id=?`).run(tradeId);
+    db.prepare(`UPDATE listings SET status='active' WHERE id=?`).run(listing.id);
+    return res.status(500).json({ error: 'could not create payment: ' + e.message });
+  }
+
+  const paymentWindowExpiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+  db.prepare(`UPDATE trades SET payment_intent_id=?, payment_client_secret=?, payment_window_expires_at=? WHERE id=?`)
+    .run(pi.id, pi.client_secret, paymentWindowExpiresAt, tradeId);
   notify(buyerId,  '🎉', `<strong>${req.user.handle}</strong> accepted your ${amountDisplay} offer for ${listing.artist}!`, 'wallet');
   notify(sellerId, '🎉', `You accepted <strong>@${buyerHandle}</strong>'s ${amountDisplay} offer. Send the ticket next.`, 'wallet');
   // Transactional emails (best-effort — never block the response).
@@ -771,7 +858,83 @@ app.post('/api/offers/:id/accept', authRequired, verifiedRequired, payoutsRequir
     notify(sib.from_user_id, '📪', `Your offer on ${listing.artist} was auto-declined because another offer was accepted.`, 'myTickets', { tab: 'outgoing' });
   }
 
-  res.json({ trade_id: tradeId });
+  res.json({
+    trade_id: tradeId,
+    payment_client_secret: pi.client_secret,
+    payment_intent_id: pi.id,
+    amount_cents: amountCents,
+    payment_window_expires_at: paymentWindowExpiresAt,
+  });
+});
+
+// ===== PAYMENT (Phase 2) =====
+// Buyer fetches the PaymentIntent client_secret to render Stripe Elements.
+// Also returns the current payment window so the frontend can show a countdown.
+app.get('/api/trades/:id/payment', authRequired, stripeRequired, async (req, res) => {
+  await sweepExpiredPayment(req.params.id);
+  const trade = db.prepare('SELECT * FROM trades WHERE id=?').get(req.params.id);
+  if (!trade) return res.status(404).json({ error: 'not found' });
+  if (trade.buyer_id !== req.user.id) return res.status(403).json({ error: 'only the buyer can pay' });
+  if (!trade.payment_intent_id) return res.status(400).json({ error: 'no payment attached' });
+  res.json({
+    payment_status: trade.payment_status,
+    client_secret: trade.payment_client_secret,
+    amount_cents: trade.amount_cents,
+    window_expires_at: trade.payment_window_expires_at,
+    expired: isPaymentExpired(trade),
+  });
+});
+
+// Buyer-initiated cancel (e.g. closed checkout before paying). Voids the PI, returns listing to active.
+app.post('/api/trades/:id/cancel-payment', authRequired, stripeRequired, async (req, res) => {
+  const trade = db.prepare('SELECT * FROM trades WHERE id=?').get(req.params.id);
+  if (!trade) return res.status(404).json({ error: 'not found' });
+  if (trade.buyer_id !== req.user.id) return res.status(403).json({ error: 'only the buyer can cancel' });
+  if (trade.payment_status !== 'pending') return res.status(400).json({ error: 'cannot cancel once paid' });
+  if (trade.payment_intent_id) {
+    try { await stripe.paymentIntents.cancel(trade.payment_intent_id); }
+    catch (e) { console.error('[cancel-payment] PI cancel failed:', e.message); }
+  }
+  const tx = db.transaction(() => {
+    db.prepare(`UPDATE trades SET payment_status='canceled', status='canceled' WHERE id=?`).run(trade.id);
+    db.prepare(`UPDATE listings SET status='active' WHERE id=?`).run(trade.listing_id);
+  });
+  tx();
+  notify(trade.seller_id, '↩️', 'Buyer canceled the payment — your listing is live again.', 'myTickets');
+  res.json({ ok: true });
+});
+
+// Stripe.js confirms the payment directly with Stripe on the frontend; this endpoint
+// is called after that succeeds so the backend syncs payment_status to 'paid' and notifies the seller.
+// We double-check by fetching the PI from Stripe to confirm it actually succeeded.
+app.post('/api/trades/:id/confirm-payment', authRequired, stripeRequired, async (req, res) => {
+  const trade = db.prepare('SELECT * FROM trades WHERE id=?').get(req.params.id);
+  if (!trade) return res.status(404).json({ error: 'not found' });
+  if (trade.buyer_id !== req.user.id) return res.status(403).json({ error: 'only the buyer can confirm' });
+  if (trade.payment_status === 'paid') return res.json({ ok: true, already_paid: true });
+
+  let pi;
+  try { pi = await stripe.paymentIntents.retrieve(trade.payment_intent_id); }
+  catch (e) { return res.status(500).json({ error: 'could not verify payment: ' + e.message }); }
+
+  if (pi.status !== 'succeeded') {
+    return res.status(400).json({ error: 'payment not yet succeeded', stripe_status: pi.status });
+  }
+  db.prepare(`UPDATE trades SET payment_status='paid' WHERE id=?`).run(trade.id);
+  db.prepare(`INSERT INTO payments (user_id, kind, amount_cents, stripe_id, trade_id) VALUES (?, 'escrow_hold', ?, ?, ?)`)
+    .run(trade.buyer_id, trade.amount_cents, pi.id, trade.id);
+  const sellerForEmail = getUserForEmail(trade.seller_id);
+  notify(trade.seller_id, '💰', 'Buyer paid — you can mark the ticket as sent now.', 'wallet');
+  sendTransactionalEmail(sellerForEmail, {
+    subject: 'Buyer paid — send the ticket',
+    headline: 'Payment received',
+    body: [
+      `The buyer has paid for trade #${trade.id}. Funds are held in escrow.`,
+      `Transfer the ticket through your venue app, then mark it as sent in Ribbon Reflector.`,
+    ],
+    cta: { label: 'Open trade', url: `${FRONTEND_URL}` },
+  });
+  res.json({ ok: true });
 });
 
 app.post('/api/offers/:id/decline', authRequired, (req, res) => {
@@ -784,7 +947,8 @@ app.post('/api/offers/:id/decline', authRequired, (req, res) => {
 
 // ===== TRADES =====
 // Cash-mode trade fetch: single listing, buyer + seller. Only the two parties can read.
-app.get('/api/trades/:id', authRequired, (req, res) => {
+app.get('/api/trades/:id', authRequired, async (req, res) => {
+  await sweepExpiredPayment(req.params.id);
   const trade = db.prepare(`SELECT t.*,
     l.artist AS listing_artist, l.venue AS listing_venue, l.city AS listing_city,
     l.event_date AS listing_date, l.seat AS listing_seat, l.face_value AS listing_face_value,
@@ -806,7 +970,7 @@ app.get('/api/trades/:id', authRequired, (req, res) => {
 //   seller calls mark-sent → sets seller_sent=1
 //   buyer calls mark-received → sets buyer_received=1
 // When both are true, trade completes and escrow releases to seller (single payment row).
-app.post('/api/trades/:id/mark-sent', authRequired, (req, res) => {
+app.post('/api/trades/:id/mark-sent', authRequired, paidRequired, (req, res) => {
   const trade = db.prepare('SELECT * FROM trades WHERE id=?').get(req.params.id);
   if (!trade) return res.status(404).json({ error: 'not found' });
   if (trade.status !== 'active') return res.status(400).json({ error: 'trade is ' + trade.status });
