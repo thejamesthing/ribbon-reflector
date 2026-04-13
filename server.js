@@ -437,17 +437,17 @@ function maybeCompleteTrade(tradeId) {
 // ===== MESSAGES =====
 app.get('/api/trades/:id/messages', authRequired, (req, res) => {
   const trade = db.prepare('SELECT * FROM trades WHERE id=?').get(req.params.id);
-  if (!trade || (trade.user_a_id !== req.user.id && trade.user_b_id !== req.user.id)) return res.status(404).json({ error: 'not found' });
+  if (!trade || (trade.buyer_id !== req.user.id && trade.seller_id !== req.user.id)) return res.status(404).json({ error: 'not found' });
   res.json(db.prepare(`SELECT m.*, u.handle AS sender_handle FROM messages m JOIN users u ON u.id=m.sender_id WHERE trade_id=? ORDER BY created_at ASC`).all(trade.id));
 });
 
 app.post('/api/trades/:id/messages', authRequired, (req, res) => {
   const trade = db.prepare('SELECT * FROM trades WHERE id=?').get(req.params.id);
-  if (!trade || (trade.user_a_id !== req.user.id && trade.user_b_id !== req.user.id)) return res.status(404).json({ error: 'not found' });
+  if (!trade || (trade.buyer_id !== req.user.id && trade.seller_id !== req.user.id)) return res.status(404).json({ error: 'not found' });
   const { body } = req.body;
   if (!body?.trim()) return res.status(400).json({ error: 'empty message' });
   const result = db.prepare('INSERT INTO messages (trade_id, sender_id, body) VALUES (?,?,?)').run(trade.id, req.user.id, body.trim());
-  const otherUser = trade.user_a_id === req.user.id ? trade.user_b_id : trade.user_a_id;
+  const otherUser = trade.buyer_id === req.user.id ? trade.seller_id : trade.buyer_id;
   notify(otherUser, '💬', `New message from <strong>${req.user.handle}</strong>.`, 'wallet');
   res.json({ id: result.lastInsertRowid });
 });
@@ -455,15 +455,15 @@ app.post('/api/trades/:id/messages', authRequired, (req, res) => {
 // ===== DISPUTES =====
 app.post('/api/trades/:id/dispute', authRequired, (req, res) => {
   const trade = db.prepare('SELECT * FROM trades WHERE id=?').get(req.params.id);
-  if (!trade || (trade.user_a_id !== req.user.id && trade.user_b_id !== req.user.id)) return res.status(404).json({ error: 'not found' });
+  if (!trade || (trade.buyer_id !== req.user.id && trade.seller_id !== req.user.id)) return res.status(404).json({ error: 'not found' });
   if (trade.status !== 'active') return res.status(400).json({ error: 'trade is ' + trade.status });
   const { reason, details, evidence_filename } = req.body;
   if (!reason || !details) return res.status(400).json({ error: 'reason and details required' });
   db.prepare('INSERT INTO disputes (trade_id, filed_by_id, reason, details, evidence_filename) VALUES (?,?,?,?,?)')
     .run(trade.id, req.user.id, reason, details, evidence_filename || null);
   db.prepare(`UPDATE trades SET status='disputed' WHERE id=?`).run(trade.id);
-  notify(trade.user_a_id, '⚠️', `Dispute opened on trade #${trade.id}. Support will reach out within 24h.`, 'wallet');
-  notify(trade.user_b_id, '⚠️', `Dispute opened on trade #${trade.id}. Support will reach out within 24h.`, 'wallet');
+  notify(trade.buyer_id,  '⚠️', `Dispute opened on trade #${trade.id}. Support will reach out within 24h.`, 'wallet');
+  notify(trade.seller_id, '⚠️', `Dispute opened on trade #${trade.id}. Support will reach out within 24h.`, 'wallet');
   res.json({ ok: true });
 });
 
@@ -473,9 +473,9 @@ app.post('/api/reviews', authRequired, (req, res) => {
   if (!trade_id || !stars) return res.status(400).json({ error: 'trade_id and stars required' });
   const trade = db.prepare('SELECT * FROM trades WHERE id=?').get(trade_id);
   if (!trade) return res.status(404).json({ error: 'trade not found' });
-  if (trade.user_a_id !== req.user.id && trade.user_b_id !== req.user.id) return res.status(403).json({ error: 'not your trade' });
+  if (trade.buyer_id !== req.user.id && trade.seller_id !== req.user.id) return res.status(403).json({ error: 'not your trade' });
   if (trade.status !== 'complete') return res.status(400).json({ error: 'can only review completed trades' });
-  const subject = trade.user_a_id === req.user.id ? trade.user_b_id : trade.user_a_id;
+  const subject = trade.buyer_id === req.user.id ? trade.seller_id : trade.buyer_id;
   const result = db.prepare('INSERT INTO reviews (trade_id, author_id, subject_id, stars, body) VALUES (?,?,?,?,?)')
     .run(trade_id, req.user.id, subject, stars, body || '');
   notify(subject, '⭐', `<strong>${req.user.handle}</strong> left you a ${stars}-star review.`, 'profile', { handle: db.prepare('SELECT handle FROM users WHERE id=?').get(subject).handle });
