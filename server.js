@@ -217,6 +217,40 @@ function sendPasswordResetEmail(user, token) {
   });
 }
 
+
+// Generic transactional template — keeps the from/branding consistent.
+// Pass the subject, a 1-line headline, the body paragraphs (HTML strings),
+// and an optional CTA { label, url }. Body fragments should already be HTML-safe.
+function sendTransactionalEmail(user, { subject, headline, body, cta }) {
+  if (!user?.email) return Promise.resolve({ skipped: 'no email' });
+  const ctaHTML = cta
+    ? `<p style="margin:24px 0"><a href="${cta.url}" style="display:inline-block;background:#1a1a1a;color:#fff;padding:12px 22px;border-radius:8px;text-decoration:none;font-weight:600">${cta.label}</a></p>`
+    : '';
+  const ctaText = cta ? `\n\n${cta.label}: ${cta.url}` : '';
+  const bodyHTML = body.map(p => `<p>${p}</p>`).join('');
+  const bodyText = body.map(p => p.replace(/<[^>]+>/g, '')).join('\n\n');
+  return sendEmail({
+    to: user.email,
+    subject,
+    text: `Hi ${user.handle},\n\n${headline.replace(/<[^>]+>/g, '')}\n\n${bodyText}${ctaText}\n\n— Ribbon Reflector`,
+    html: `<div style="font-family:-apple-system,Segoe UI,sans-serif;max-width:520px;margin:0 auto;padding:24px;color:#1a1a1a">
+      <h2 style="margin:0 0 14px">${headline}</h2>
+      <p>Hi ${user.handle},</p>
+      ${bodyHTML}
+      ${ctaHTML}
+      <p style="color:#999;font-size:12px;margin-top:24px;border-top:1px solid #eee;padding-top:12px">
+        — Ribbon Reflector<br>
+        <a href="${FRONTEND_URL}" style="color:#999">${FRONTEND_URL.replace(/^https?:\/\//, '')}</a>
+      </p>
+    </div>`,
+  }).catch(e => { console.error('[tx-email] failed:', e.message); return { failed: true }; });
+}
+
+// Helper to grab user record for emailing — we often have only an ID at the notify site.
+function getUserForEmail(userId) {
+  return db.prepare('SELECT id, handle, email FROM users WHERE id=?').get(userId);
+}
+
 // Middleware: returns 403 until the user has verified their email.
 function verifiedRequired(req, res, next) {
   if (!req.user?.email_verified) {
@@ -596,6 +630,27 @@ app.post('/api/offers/:id/accept', authRequired, verifiedRequired, (req, res) =>
   const amountDisplay = `$${(amountCents/100).toFixed(2)}`;
   notify(buyerId,  '🎉', `<strong>${req.user.handle}</strong> accepted your ${amountDisplay} offer for ${listing.artist}!`, 'wallet');
   notify(sellerId, '🎉', `You accepted <strong>@${buyerHandle}</strong>'s ${amountDisplay} offer. Send the ticket next.`, 'wallet');
+  // Transactional emails (best-effort — never block the response).
+  const buyerUser  = getUserForEmail(buyerId);
+  const sellerUser = getUserForEmail(sellerId);
+  sendTransactionalEmail(buyerUser, {
+    subject: `Your offer was accepted — ${listing.artist}`,
+    headline: 'Your offer was accepted!',
+    body: [
+      `<strong>@${req.user.handle}</strong> accepted your <strong>${amountDisplay}</strong> offer for <strong>${listing.artist}</strong> at ${listing.venue}${listing.event_date ? ' on ' + listing.event_date : ''}.`,
+      `Your card was charged and the funds are held in escrow. The seller will transfer the ticket next; you\'ll get another email when they mark it sent.`,
+    ],
+    cta: { label: 'View trade', url: `${FRONTEND_URL}` },
+  });
+  sendTransactionalEmail(sellerUser, {
+    subject: `You accepted an offer — send the ticket next`,
+    headline: 'Trade in motion',
+    body: [
+      `You accepted <strong>@${buyerHandle}</strong>\'s <strong>${amountDisplay}</strong> offer for <strong>${listing.artist}</strong>.`,
+      `Funds are held in escrow. Transfer the ticket through your venue/ticketing app, then mark it as sent in Ribbon Reflector. Once the buyer confirms receipt, escrow releases to you.`,
+    ],
+    cta: { label: 'Open trade', url: `${FRONTEND_URL}` },
+  });
   for (const sib of siblings) {
     notify(sib.from_user_id, '📪', `Your offer on ${listing.artist} was auto-declined because another offer was accepted.`, 'myTickets', { tab: 'outgoing' });
   }
@@ -647,6 +702,16 @@ app.post('/api/trades/:id/mark-sent', authRequired, (req, res) => {
   const after = db.prepare('SELECT * FROM trades WHERE id=?').get(trade.id);
   if (after.status === 'active') {
     notify(trade.buyer_id, '✈️', 'Seller marked the ticket as sent. Confirm when you receive it.', 'wallet');
+    const buyerForEmail = getUserForEmail(trade.buyer_id);
+    sendTransactionalEmail(buyerForEmail, {
+      subject: 'Your ticket is on the way',
+      headline: 'Seller marked the ticket as sent',
+      body: [
+        `The seller has transferred the ticket. Check your venue/ticketing app for the incoming transfer.`,
+        `Once you\'ve received it, head back to Ribbon Reflector and confirm receipt — that\'s what releases the funds from escrow to the seller.`,
+      ],
+      cta: { label: 'Confirm receipt', url: `${FRONTEND_URL}` },
+    });
   }
   res.json(after);
 });
@@ -683,6 +748,26 @@ function maybeCompleteTrade(tradeId) {
 
   notify(t.buyer_id,  '✓', 'Trade complete — enjoy the show! Leave a review when you can.', 'reviews');
   notify(t.seller_id, '✓', 'Trade complete — escrow released to you. Leave a review for the buyer.', 'reviews');
+  const buyerDone  = getUserForEmail(t.buyer_id);
+  const sellerDone = getUserForEmail(t.seller_id);
+  sendTransactionalEmail(buyerDone, {
+    subject: 'Trade complete — enjoy the show 🎟️',
+    headline: 'You\'re all set',
+    body: [
+      `You confirmed receipt and escrow has been released to the seller. The trade is complete.`,
+      `If everything went smoothly, leaving a quick review helps the next fan trust this seller.`,
+    ],
+    cta: { label: 'Leave a review', url: `${FRONTEND_URL}` },
+  });
+  sendTransactionalEmail(sellerDone, {
+    subject: 'Trade complete — escrow released',
+    headline: 'Funds released to you',
+    body: [
+      `The buyer confirmed receipt of the ticket and escrow has been released. The trade is complete.`,
+      `Help the buyer build their reputation by leaving a quick review.`,
+    ],
+    cta: { label: 'Leave a review', url: `${FRONTEND_URL}` },
+  });
 }
 
 // ===== MESSAGES =====
@@ -715,6 +800,19 @@ app.post('/api/trades/:id/dispute', authRequired, (req, res) => {
   db.prepare(`UPDATE trades SET status='disputed' WHERE id=?`).run(trade.id);
   notify(trade.buyer_id,  '⚠️', `Dispute opened on trade #${trade.id}. Support will reach out within 24h.`, 'wallet');
   notify(trade.seller_id, '⚠️', `Dispute opened on trade #${trade.id}. Support will reach out within 24h.`, 'wallet');
+  const buyerDispute  = getUserForEmail(trade.buyer_id);
+  const sellerDispute = getUserForEmail(trade.seller_id);
+  for (const u of [buyerDispute, sellerDispute]) {
+    sendTransactionalEmail(u, {
+      subject: `Dispute opened — trade #${trade.id}`,
+      headline: 'A dispute was filed on your trade',
+      body: [
+        `A dispute was filed on trade #${trade.id}. Funds are held in escrow until the case is resolved.`,
+        `Our support team will email both parties within 24 hours. In the meantime, please don\'t take any further action on this trade.`,
+      ],
+      cta: { label: 'View trade', url: `${FRONTEND_URL}` },
+    });
+  }
   res.json({ ok: true });
 });
 
@@ -733,7 +831,17 @@ app.post('/api/reviews', authRequired, verifiedRequired, (req, res) => {
   const subject = trade.buyer_id === req.user.id ? trade.seller_id : trade.buyer_id;
   const result = db.prepare('INSERT INTO reviews (trade_id, author_id, subject_id, stars, body) VALUES (?,?,?,?,?)')
     .run(trade_id, req.user.id, subject, starsInt, body || '');
-  notify(subject, '⭐', `<strong>${req.user.handle}</strong> left you a ${starsInt}-star review.`, 'profile', { handle: db.prepare('SELECT handle FROM users WHERE id=?').get(subject).handle });
+  const subjectUser = getUserForEmail(subject);
+  notify(subject, '⭐', `<strong>${req.user.handle}</strong> left you a ${starsInt}-star review.`, 'profile', { handle: subjectUser.handle });
+  sendTransactionalEmail(subjectUser, {
+    subject: `${req.user.handle} left you a ${starsInt}-star review`,
+    headline: `New review from @${req.user.handle.replace('@','')}`,
+    body: [
+      `<strong>@${req.user.handle.replace('@','')}</strong> left you a <strong>${starsInt}-star</strong> review.`,
+      body ? `&ldquo;${body.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'})[c])}&rdquo;` : `(No comment.)`,
+    ],
+    cta: { label: 'View your profile', url: `${FRONTEND_URL}` },
+  });
   res.json({ id: result.lastInsertRowid });
 });
 
