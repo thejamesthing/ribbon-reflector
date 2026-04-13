@@ -117,6 +117,19 @@ function makeToken(userId) {
   return jwt.sign({ userId }, JWT_SECRET, { expiresIn: '30d' });
 }
 
+function authOptional(req, res, next) {
+  const authHeader = req.headers.authorization || '';
+  const headerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  const token = headerToken || req.cookies.rr_token;
+  if (!token) return next();
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    const user = db.prepare('SELECT id, handle, email, is_member, member_until, bio FROM users WHERE id = ?').get(payload.userId);
+    if (user) req.user = user;
+  } catch {}
+  next();
+}
+
 // ===== NOTIFICATIONS HELPER =====
 function notify(userId, icon, text, route, params) {
   db.prepare('INSERT INTO notifications (user_id, icon, text, route, params) VALUES (?, ?, ?, ?, ?)')
@@ -224,14 +237,35 @@ app.get('/api/events/:key', (req, res) => {
 });
 
 // ===== USER PROFILES =====
-app.get('/api/users/:handle', (req, res) => {
+app.get('/api/users/:handle', authOptional, (req, res) => {
   const handle = req.params.handle.startsWith('@') ? req.params.handle : '@' + req.params.handle;
   const user = db.prepare('SELECT id, handle, bio, created_at FROM users WHERE handle = ?').get(handle);
   if (!user) return res.status(404).json({ error: 'not found' });
   const listings = db.prepare(`SELECT * FROM listings WHERE owner_id=? AND status='active'`).all(user.id);
   const reviews = db.prepare(`SELECT r.*, u.handle AS author_handle FROM reviews r JOIN users u ON u.id=r.author_id WHERE r.subject_id=? ORDER BY r.created_at DESC`).all(user.id);
   const avgRow = db.prepare('SELECT AVG(stars) AS avg, COUNT(*) AS n FROM reviews WHERE subject_id=?').get(user.id);
-  res.json({ user, listings, reviews, trust_score: avgRow.n ? Math.round((avgRow.avg/5)*100) : 0, reviews_count: avgRow.n });
+  const friendsRow = db.prepare(`SELECT COUNT(*) AS n FROM friendships WHERE status='accepted' AND (requester_id=? OR recipient_id=?)`).get(user.id, user.id);
+  let friendship_status = 'none';
+  if (req.user) {
+    if (req.user.id === user.id) {
+      friendship_status = 'self';
+    } else {
+      const f = db.prepare(`SELECT * FROM friendships WHERE
+        (requester_id=? AND recipient_id=?) OR (requester_id=? AND recipient_id=?)`)
+        .get(req.user.id, user.id, user.id, req.user.id);
+      if (f) {
+        if (f.status === 'accepted') friendship_status = 'friends';
+        else if (f.requester_id === req.user.id) friendship_status = 'pending_outgoing';
+        else friendship_status = 'pending_incoming';
+      }
+    }
+  }
+  res.json({ user, listings, reviews,
+    trust_score: avgRow.n ? Math.round((avgRow.avg/5)*100) : 0,
+    reviews_count: avgRow.n,
+    friends_count: friendsRow.n,
+    friendship_status,
+  });
 });
 
 // ===== OFFERS (cash-only, one-directional) =====
@@ -471,15 +505,80 @@ app.post('/api/trades/:id/dispute', authRequired, (req, res) => {
 app.post('/api/reviews', authRequired, (req, res) => {
   const { trade_id, stars, body } = req.body;
   if (!trade_id || !stars) return res.status(400).json({ error: 'trade_id and stars required' });
+  const starsInt = Number.parseInt(stars, 10);
+  if (!Number.isFinite(starsInt) || starsInt < 1 || starsInt > 5) return res.status(400).json({ error: 'stars must be 1-5' });
   const trade = db.prepare('SELECT * FROM trades WHERE id=?').get(trade_id);
   if (!trade) return res.status(404).json({ error: 'trade not found' });
   if (trade.buyer_id !== req.user.id && trade.seller_id !== req.user.id) return res.status(403).json({ error: 'not your trade' });
   if (trade.status !== 'complete') return res.status(400).json({ error: 'can only review completed trades' });
+  const existing = db.prepare('SELECT id FROM reviews WHERE trade_id=? AND author_id=?').get(trade_id, req.user.id);
+  if (existing) return res.status(409).json({ error: 'you have already reviewed this trade' });
   const subject = trade.buyer_id === req.user.id ? trade.seller_id : trade.buyer_id;
   const result = db.prepare('INSERT INTO reviews (trade_id, author_id, subject_id, stars, body) VALUES (?,?,?,?,?)')
-    .run(trade_id, req.user.id, subject, stars, body || '');
-  notify(subject, '⭐', `<strong>${req.user.handle}</strong> left you a ${stars}-star review.`, 'profile', { handle: db.prepare('SELECT handle FROM users WHERE id=?').get(subject).handle });
+    .run(trade_id, req.user.id, subject, starsInt, body || '');
+  notify(subject, '⭐', `<strong>${req.user.handle}</strong> left you a ${starsInt}-star review.`, 'profile', { handle: db.prepare('SELECT handle FROM users WHERE id=?').get(subject).handle });
   res.json({ id: result.lastInsertRowid });
+});
+
+// ===== FRIENDS =====
+app.get('/api/friends', authRequired, (req, res) => {
+  const me = req.user.id;
+  const rows = db.prepare(`SELECT f.*, ru.handle AS requester_handle, cu.handle AS recipient_handle
+    FROM friendships f
+    JOIN users ru ON ru.id = f.requester_id
+    JOIN users cu ON cu.id = f.recipient_id
+    WHERE f.requester_id=? OR f.recipient_id=?
+    ORDER BY f.created_at DESC`).all(me, me);
+  const friends = [], incoming = [], outgoing = [];
+  for (const r of rows) {
+    const otherHandle = r.requester_id === me ? r.recipient_handle : r.requester_handle;
+    if (r.status === 'accepted') friends.push({ id: r.id, handle: otherHandle, since: r.accepted_at });
+    else if (r.requester_id === me) outgoing.push({ id: r.id, handle: otherHandle, sent_at: r.created_at });
+    else incoming.push({ id: r.id, handle: otherHandle, sent_at: r.created_at });
+  }
+  res.json({ friends, incoming, outgoing });
+});
+
+app.post('/api/friends/:handle', authRequired, (req, res) => {
+  const handle = req.params.handle.startsWith('@') ? req.params.handle : '@' + req.params.handle;
+  const target = db.prepare('SELECT id, handle FROM users WHERE handle=?').get(handle);
+  if (!target) return res.status(404).json({ error: 'user not found' });
+  if (target.id === req.user.id) return res.status(400).json({ error: 'cannot friend yourself' });
+  const existing = db.prepare(`SELECT * FROM friendships WHERE
+    (requester_id=? AND recipient_id=?) OR (requester_id=? AND recipient_id=?)`)
+    .get(req.user.id, target.id, target.id, req.user.id);
+  if (existing) {
+    if (existing.status === 'accepted') return res.json({ status: 'friends' });
+    if (existing.requester_id === req.user.id) return res.json({ status: 'pending_outgoing' });
+    db.prepare(`UPDATE friendships SET status='accepted', accepted_at=CURRENT_TIMESTAMP WHERE id=?`).run(existing.id);
+    notify(target.id, '🤝', `<strong>${req.user.handle}</strong> accepted your friend request.`, 'profile', { handle: req.user.handle });
+    return res.json({ status: 'friends' });
+  }
+  db.prepare('INSERT INTO friendships (requester_id, recipient_id) VALUES (?,?)').run(req.user.id, target.id);
+  notify(target.id, '🤝', `<strong>${req.user.handle}</strong> sent you a friend request.`, 'profile', { handle: req.user.handle });
+  res.json({ status: 'pending_outgoing' });
+});
+
+app.post('/api/friends/:handle/accept', authRequired, (req, res) => {
+  const handle = req.params.handle.startsWith('@') ? req.params.handle : '@' + req.params.handle;
+  const requester = db.prepare('SELECT id, handle FROM users WHERE handle=?').get(handle);
+  if (!requester) return res.status(404).json({ error: 'user not found' });
+  const f = db.prepare(`SELECT * FROM friendships WHERE requester_id=? AND recipient_id=? AND status='pending'`)
+    .get(requester.id, req.user.id);
+  if (!f) return res.status(404).json({ error: 'no pending request from this user' });
+  db.prepare(`UPDATE friendships SET status='accepted', accepted_at=CURRENT_TIMESTAMP WHERE id=?`).run(f.id);
+  notify(requester.id, '🤝', `<strong>${req.user.handle}</strong> accepted your friend request.`, 'profile', { handle: req.user.handle });
+  res.json({ status: 'friends' });
+});
+
+app.delete('/api/friends/:handle', authRequired, (req, res) => {
+  const handle = req.params.handle.startsWith('@') ? req.params.handle : '@' + req.params.handle;
+  const other = db.prepare('SELECT id FROM users WHERE handle=?').get(handle);
+  if (!other) return res.status(404).json({ error: 'user not found' });
+  const result = db.prepare(`DELETE FROM friendships WHERE
+    (requester_id=? AND recipient_id=?) OR (requester_id=? AND recipient_id=?)`)
+    .run(req.user.id, other.id, other.id, req.user.id);
+  res.json({ status: 'none', removed: result.changes });
 });
 
 // ===== NOTIFICATIONS =====
