@@ -297,38 +297,58 @@ app.get('/api/offers/outgoing', authRequired, (req, res) => {
     WHERE o.from_user_id=? ORDER BY o.created_at DESC`).all(req.user.id));
 });
 
-// Accept an offer → charge both cards (mock), create trade
+// Accept an offer (cash-mode): charge buyer for amount_cents, create trade, mark listing traded, auto-decline siblings.
+// Seller is the acceptor (offer.to_user_id); buyer is offer.from_user_id.
 app.post('/api/offers/:id/accept', authRequired, (req, res) => {
   const offer = db.prepare('SELECT * FROM offers WHERE id=?').get(req.params.id);
   if (!offer) return res.status(404).json({ error: 'not found' });
   if (offer.to_user_id !== req.user.id) return res.status(403).json({ error: 'not your offer to accept' });
   if (offer.status !== 'pending') return res.status(400).json({ error: 'offer already ' + offer.status });
 
-  const target = db.prepare('SELECT * FROM listings WHERE id=?').get(offer.target_listing_id);
-  const offered = db.prepare('SELECT * FROM listings WHERE id=?').get(offer.offered_listing_id);
-  const holdCents = Math.round((Number(target.face_value) + Number(offered.face_value)) * 100);
-  const chargeA = mockStripeCharge({ userId: offer.to_user_id,   amountCents: holdCents, description: `Escrow hold — trade for ${target.artist}` });
-  const chargeB = mockStripeCharge({ userId: offer.from_user_id, amountCents: holdCents, description: `Escrow hold — trade for ${offered.artist}` });
+  const listing = db.prepare('SELECT * FROM listings WHERE id=?').get(offer.target_listing_id);
+  if (!listing) return res.status(404).json({ error: 'listing not found' });
+  if (listing.status !== 'active') return res.status(400).json({ error: 'listing is no longer available' });
+
+  const buyerId = offer.from_user_id;
+  const sellerId = offer.to_user_id;
+  const amountCents = offer.amount_cents;
+
+  // Charge buyer only. Seller is not charged under cash-mode.
+  const charge = mockStripeCharge({ userId: buyerId, amountCents, description: `Escrow hold — ${listing.artist}` });
 
   const tx = db.transaction(() => {
     db.prepare(`UPDATE offers SET status='accepted' WHERE id=?`).run(offer.id);
-    const tradeResult = db.prepare(`INSERT INTO trades
-      (offer_id, user_a_id, user_b_id, listing_a_id, listing_b_id, escrow_charge_a, escrow_charge_b)
-      VALUES (?,?,?,?,?,?,?)`)
-      .run(offer.id, offer.to_user_id, offer.from_user_id, offer.target_listing_id, offer.offered_listing_id, chargeA.id, chargeB.id);
-    db.prepare(`UPDATE listings SET status='traded' WHERE id IN (?, ?)`).run(offer.target_listing_id, offer.offered_listing_id);
-    db.prepare(`INSERT INTO payments (user_id, kind, amount_cents, stripe_id, trade_id) VALUES (?, 'escrow_hold', ?, ?, ?), (?, 'escrow_hold', ?, ?, ?)`)
-      .run(offer.to_user_id, holdCents, chargeA.id, tradeResult.lastInsertRowid,
-           offer.from_user_id, holdCents, chargeB.id, tradeResult.lastInsertRowid);
-    // Auto-decline any other pending offers on these listings
-    db.prepare(`UPDATE offers SET status='declined' WHERE status='pending' AND (target_listing_id IN (?,?) OR offered_listing_id IN (?,?))`)
-      .run(offer.target_listing_id, offer.offered_listing_id, offer.target_listing_id, offer.offered_listing_id);
-    return tradeResult.lastInsertRowid;
-  });
-  const tradeId = tx();
 
-  notify(offer.from_user_id, '🎉', `<strong>${req.user.handle}</strong> accepted your offer!`, 'wallet');
-  notify(offer.to_user_id,   '🎉', `You accepted <strong>${db.prepare('SELECT handle FROM users WHERE id=?').get(offer.from_user_id).handle}</strong>'s offer.`, 'wallet');
+    const tradeResult = db.prepare(`INSERT INTO trades
+      (offer_id, buyer_id, seller_id, listing_id, amount_cents, escrow_charge_id)
+      VALUES (?,?,?,?,?,?)`)
+      .run(offer.id, buyerId, sellerId, listing.id, amountCents, charge.id);
+
+    db.prepare(`UPDATE listings SET status='traded' WHERE id=?`).run(listing.id);
+
+    db.prepare(`INSERT INTO payments (user_id, kind, amount_cents, stripe_id, trade_id) VALUES (?, 'escrow_hold', ?, ?, ?)`)
+      .run(buyerId, amountCents, charge.id, tradeResult.lastInsertRowid);
+
+    // Auto-decline all other pending offers on this listing — one winner per listing.
+    const siblings = db.prepare(`SELECT id, from_user_id FROM offers WHERE target_listing_id=? AND status='pending' AND id != ?`)
+      .all(listing.id, offer.id);
+    if (siblings.length) {
+      db.prepare(`UPDATE offers SET status='declined' WHERE target_listing_id=? AND status='pending' AND id != ?`)
+        .run(listing.id, offer.id);
+    }
+
+    return { tradeId: tradeResult.lastInsertRowid, siblings };
+  });
+  const { tradeId, siblings } = tx();
+
+  const buyerHandle = db.prepare('SELECT handle FROM users WHERE id=?').get(buyerId).handle;
+  const amountDisplay = `$${(amountCents/100).toFixed(2)}`;
+  notify(buyerId,  '🎉', `<strong>${req.user.handle}</strong> accepted your ${amountDisplay} offer for ${listing.artist}!`, 'wallet');
+  notify(sellerId, '🎉', `You accepted <strong>@${buyerHandle}</strong>'s ${amountDisplay} offer. Send the ticket next.`, 'wallet');
+  for (const sib of siblings) {
+    notify(sib.from_user_id, '📪', `Your offer on ${listing.artist} was auto-declined because another offer was accepted.`, 'myTickets', { tab: 'outgoing' });
+  }
+
   res.json({ trade_id: tradeId });
 });
 
