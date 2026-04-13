@@ -96,6 +96,19 @@ db.exec(schema);
     }
   }
 }
+// ===== STRIPE CONNECT COLUMN MIGRATION (Phase 1) =====
+{
+  const have = new Set(db.prepare("PRAGMA table_info(users)").all().map(c => c.name));
+  for (const [col, type] of [
+    ['stripe_account_id', 'TEXT'],
+    ['stripe_account_status', "TEXT NOT NULL DEFAULT 'none'"],
+  ]) {
+    if (!have.has(col)) {
+      console.log('[migration] users: adding column', col);
+      db.exec(`ALTER TABLE users ADD COLUMN ${col} ${type}`);
+    }
+  }
+}
 // ===== APP =====
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -139,7 +152,7 @@ function authRequired(req, res, next) {
   if (!token) return res.status(401).json({ error: 'not authenticated' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT id, handle, email, is_member, member_until, bio, avatar_data_url, link, city, region, email_verified, email_verification_sent_at FROM users WHERE id = ?').get(payload.userId);
+    const user = db.prepare('SELECT id, handle, email, is_member, member_until, bio, avatar_data_url, link, city, region, email_verified, email_verification_sent_at, stripe_account_id, stripe_account_status FROM users WHERE id = ?').get(payload.userId);
     if (!user) return res.status(401).json({ error: 'user not found' });
     req.user = user;
     next();
@@ -251,6 +264,40 @@ function getUserForEmail(userId) {
   return db.prepare('SELECT id, handle, email FROM users WHERE id=?').get(userId);
 }
 
+
+// ===== STRIPE (Phase 1) =====
+const Stripe = require('stripe');
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || '';
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
+if (!stripe) console.warn('[stripe] STRIPE_SECRET_KEY not set — payment endpoints will return 503.');
+
+function stripeRequired(req, res, next) {
+  if (!stripe) return res.status(503).json({ error: 'payments not configured on server' });
+  next();
+}
+
+// Sellers can't accept offers until their Stripe Connect account is fully enabled.
+// 'pending' means they started onboarding but haven't finished (KYC, bank, etc.).
+function payoutsRequired(req, res, next) {
+  if (req.user.stripe_account_status !== 'enabled') {
+    return res.status(403).json({
+      error: 'connect a payout method before accepting offers',
+      needs_payouts_setup: true,
+    });
+  }
+  next();
+}
+
+// Map a Stripe account record to our internal status string.
+// 'enabled' = ready to receive payouts; 'pending' = onboarding incomplete; 'none' = no account.
+function deriveStripeStatus(account) {
+  if (!account) return 'none';
+  if (account.charges_enabled && account.payouts_enabled && account.details_submitted) return 'enabled';
+  return 'pending';
+}
+
 // Middleware: returns 403 until the user has verified their email.
 function verifiedRequired(req, res, next) {
   if (!req.user?.email_verified) {
@@ -267,7 +314,7 @@ function authOptional(req, res, next) {
   if (!token) return next();
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT id, handle, email, is_member, member_until, bio, avatar_data_url, link, city, region, email_verified, email_verification_sent_at FROM users WHERE id = ?').get(payload.userId);
+    const user = db.prepare('SELECT id, handle, email, is_member, member_until, bio, avatar_data_url, link, city, region, email_verified, email_verification_sent_at, stripe_account_id, stripe_account_status FROM users WHERE id = ?').get(payload.userId);
     if (user) req.user = user;
   } catch {}
   next();
@@ -342,6 +389,75 @@ app.post('/api/auth/resend-verification', authRequired, async (req, res) => {
   catch (e) { return res.status(500).json({ error: 'could not send email: ' + e.message }); }
   res.json({ ok: true });
 });
+
+// Public — frontend reads this on load to get the publishable key (no need to hardcode).
+app.get('/api/stripe/config', (req, res) => {
+  res.json({ publishable_key: STRIPE_PUBLISHABLE_KEY, configured: !!stripe });
+});
+
+// Create or refresh an Express onboarding link. Idempotent — reuses existing account if any.
+app.post('/api/stripe/connect-onboarding', authRequired, verifiedRequired, stripeRequired, async (req, res) => {
+  let acctId = req.user.stripe_account_id;
+  try {
+    if (!acctId) {
+      const acct = await stripe.accounts.create({
+        type: 'express',
+        country: 'US', // CA accounts can be created the same way; we let Stripe pick up locale on the onboarding form.
+        email: req.user.email,
+        capabilities: { transfers: { requested: true }, card_payments: { requested: true } },
+        business_type: 'individual',
+        metadata: { rr_user_id: String(req.user.id), rr_handle: req.user.handle },
+      });
+      acctId = acct.id;
+      db.prepare(`UPDATE users SET stripe_account_id=?, stripe_account_status='pending' WHERE id=?`).run(acctId, req.user.id);
+    }
+    const link = await stripe.accountLinks.create({
+      account: acctId,
+      refresh_url: `${FRONTEND_URL}/?stripe_return=1`,
+      return_url: `${FRONTEND_URL}/?stripe_return=1`,
+      type: 'account_onboarding',
+    });
+    res.json({ url: link.url, account_id: acctId });
+  } catch (e) {
+    console.error('[stripe] connect-onboarding failed:', e.message);
+    res.status(500).json({ error: 'could not start onboarding: ' + e.message });
+  }
+});
+
+// Pull live status from Stripe and sync our DB. Frontend polls this after the user returns from the onboarding flow.
+app.get('/api/stripe/account-status', authRequired, stripeRequired, async (req, res) => {
+  if (!req.user.stripe_account_id) return res.json({ status: 'none' });
+  try {
+    const acct = await stripe.accounts.retrieve(req.user.stripe_account_id);
+    const status = deriveStripeStatus(acct);
+    if (status !== req.user.stripe_account_status) {
+      db.prepare('UPDATE users SET stripe_account_status=? WHERE id=?').run(status, req.user.id);
+    }
+    res.json({
+      status,
+      details_submitted: acct.details_submitted,
+      charges_enabled: acct.charges_enabled,
+      payouts_enabled: acct.payouts_enabled,
+      requirements: acct.requirements?.currently_due || [],
+    });
+  } catch (e) {
+    console.error('[stripe] account-status failed:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Login link for sellers to access their Stripe Express dashboard (view payouts, update bank, etc.)
+app.post('/api/stripe/dashboard-link', authRequired, stripeRequired, async (req, res) => {
+  if (!req.user.stripe_account_id) return res.status(400).json({ error: 'no stripe account' });
+  try {
+    const link = await stripe.accounts.createLoginLink(req.user.stripe_account_id);
+    res.json({ url: link.url });
+  } catch (e) {
+    console.error('[stripe] dashboard-link failed:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 
 // Public — request a reset link. Always returns 200 (don't leak whether email exists).
 app.post('/api/auth/forgot-password', async (req, res) => {
@@ -584,7 +700,7 @@ app.get('/api/offers/outgoing', authRequired, (req, res) => {
 
 // Accept an offer (cash-mode): charge buyer for amount_cents, create trade, mark listing traded, auto-decline siblings.
 // Seller is the acceptor (offer.to_user_id); buyer is offer.from_user_id.
-app.post('/api/offers/:id/accept', authRequired, verifiedRequired, (req, res) => {
+app.post('/api/offers/:id/accept', authRequired, verifiedRequired, payoutsRequired, (req, res) => {
   const offer = db.prepare('SELECT * FROM offers WHERE id=?').get(req.params.id);
   if (!offer) return res.status(404).json({ error: 'not found' });
   if (offer.to_user_id !== req.user.id) return res.status(403).json({ error: 'not your offer to accept' });
