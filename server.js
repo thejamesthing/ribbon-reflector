@@ -361,18 +361,22 @@ app.post('/api/offers/:id/decline', authRequired, (req, res) => {
 });
 
 // ===== TRADES =====
+// Cash-mode trade fetch: single listing, buyer + seller. Only the two parties can read.
 app.get('/api/trades/:id', authRequired, (req, res) => {
   const trade = db.prepare(`SELECT t.*,
-    la.artist AS a_artist, la.venue AS a_venue, la.event_date AS a_date, la.seat AS a_seat, la.face_value AS a_face,
-    lb.artist AS b_artist, lb.venue AS b_venue, lb.event_date AS b_date, lb.seat AS b_seat, lb.face_value AS b_face,
-    ua.handle AS a_handle, ub.handle AS b_handle
+    l.artist AS listing_artist, l.venue AS listing_venue, l.city AS listing_city,
+    l.event_date AS listing_date, l.seat AS listing_seat, l.face_value AS listing_face_value,
+    bu.handle AS buyer_handle, su.handle AS seller_handle
     FROM trades t
-    JOIN listings la ON la.id=t.listing_a_id
-    JOIN listings lb ON lb.id=t.listing_b_id
-    JOIN users ua ON ua.id=t.user_a_id
-    JOIN users ub ON ub.id=t.user_b_id
+    JOIN listings l ON l.id=t.listing_id
+    JOIN users bu ON bu.id=t.buyer_id
+    JOIN users su ON su.id=t.seller_id
     WHERE t.id=?`).get(req.params.id);
-  if (!trade || (trade.user_a_id !== req.user.id && trade.user_b_id !== req.user.id)) return res.status(404).json({ error: 'not found' });
+  if (!trade || (trade.buyer_id !== req.user.id && trade.seller_id !== req.user.id)) {
+    return res.status(404).json({ error: 'not found' });
+  }
+  // Annotate which side the caller is — saves the frontend from doing this comparison everywhere.
+  trade.viewer_role = trade.buyer_id === req.user.id ? 'buyer' : 'seller';
   res.json(trade);
 });
 
