@@ -83,6 +83,19 @@ db.exec(schema);
     }
   }
 }
+// ===== PASSWORD RESET COLUMN MIGRATION (Step 9b) =====
+{
+  const have = new Set(db.prepare("PRAGMA table_info(users)").all().map(c => c.name));
+  for (const [col, type] of [
+    ['password_reset_token', 'TEXT'],
+    ['password_reset_expires_at', 'TIMESTAMP'],
+  ]) {
+    if (!have.has(col)) {
+      console.log('[migration] users: adding column', col);
+      db.exec(`ALTER TABLE users ADD COLUMN ${col} ${type}`);
+    }
+  }
+}
 // ===== APP =====
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -185,6 +198,25 @@ function sendVerificationEmail(user, token) {
   });
 }
 
+
+function sendPasswordResetEmail(user, token) {
+  const url = `${FRONTEND_URL}/?reset=${encodeURIComponent(token)}`;
+  return sendEmail({
+    to: user.email,
+    subject: 'Reset your password — Ribbon Reflector',
+    text: `Hi ${user.handle},\n\nWe got a request to reset your Ribbon Reflector password. Click the link below to choose a new one:\n\n${url}\n\nThis link expires in 1 hour. If you didn't request this, ignore this email — your password won't change.\n\n— Ribbon Reflector`,
+    html: `<div style="font-family:-apple-system,Segoe UI,sans-serif;max-width:520px;margin:0 auto;padding:24px;color:#1a1a1a">
+      <h2 style="margin:0 0 14px">Reset your password</h2>
+      <p>Hi ${user.handle},</p>
+      <p>We got a request to reset your Ribbon Reflector password. Click the button below to choose a new one.</p>
+      <p style="margin:24px 0"><a href="${url}" style="display:inline-block;background:#1a1a1a;color:#fff;padding:12px 22px;border-radius:8px;text-decoration:none;font-weight:600">Reset password</a></p>
+      <p style="color:#666;font-size:13px">Or paste this link into your browser:<br><span style="color:#999">${url}</span></p>
+      <p style="color:#666;font-size:13px;margin-top:20px">This link expires in 1 hour. If you didn't request this, ignore this email — your password won't change.</p>
+      <p style="color:#999;font-size:12px;margin-top:24px;border-top:1px solid #eee;padding-top:12px">— Ribbon Reflector</p>
+    </div>`,
+  });
+}
+
 // Middleware: returns 403 until the user has verified their email.
 function verifiedRequired(req, res, next) {
   if (!req.user?.email_verified) {
@@ -276,6 +308,44 @@ app.post('/api/auth/resend-verification', authRequired, async (req, res) => {
   catch (e) { return res.status(500).json({ error: 'could not send email: ' + e.message }); }
   res.json({ ok: true });
 });
+
+// Public — request a reset link. Always returns 200 (don't leak whether email exists).
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const { email } = req.body || {};
+  if (!email || typeof email !== 'string') return res.status(400).json({ error: 'email required' });
+  const user = db.prepare('SELECT id, handle, email FROM users WHERE email=?').get(email.trim().toLowerCase());
+  // Bail silently if no user — prevents email enumeration. Frontend message is generic.
+  if (!user) return res.json({ ok: true });
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
+  db.prepare('UPDATE users SET password_reset_token=?, password_reset_expires_at=? WHERE id=?')
+    .run(token, expiresAt, user.id);
+  try { await sendPasswordResetEmail(user, token); }
+  catch (e) { console.error('[forgot-password] email failed:', e.message); }
+  res.json({ ok: true });
+});
+
+// Public — consume the token + set a new password. Token is one-shot (cleared on success).
+app.post('/api/auth/reset-password/:token', (req, res) => {
+  const { password } = req.body || {};
+  if (!password || password.length < 8) return res.status(400).json({ error: 'password must be at least 8 chars' });
+  const user = db.prepare('SELECT * FROM users WHERE password_reset_token=?').get(req.params.token);
+  if (!user) return res.status(404).json({ error: 'invalid or expired reset link' });
+  if (user.password_reset_expires_at) {
+    const exp = Date.parse(user.password_reset_expires_at);
+    if (Number.isFinite(exp) && Date.now() > exp) {
+      return res.status(410).json({ error: 'reset link expired — request a new one' });
+    }
+  }
+  const hash = bcrypt.hashSync(password, 10);
+  db.prepare('UPDATE users SET password_hash=?, password_reset_token=NULL, password_reset_expires_at=NULL WHERE id=?')
+    .run(hash, user.id);
+  notify(user.id, '🔒', 'Your password was reset. If this wasn\'t you, contact support immediately.', 'home');
+  // Auto-login on success — saves the user a second flow.
+  const token = makeToken(user.id);
+  res.json({ ok: true, handle: user.handle, email: user.email, token });
+});
+
 
 app.post('/api/auth/login', (req, res) => {
   const { email, password } = req.body;
