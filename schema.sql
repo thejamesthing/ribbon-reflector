@@ -48,26 +48,24 @@ CREATE TABLE IF NOT EXISTS offers (
 CREATE INDEX IF NOT EXISTS idx_offers_to ON offers(to_user_id, status);
 CREATE INDEX IF NOT EXISTS idx_offers_from ON offers(from_user_id, status);
 CREATE INDEX IF NOT EXISTS idx_offers_target ON offers(target_listing_id, status);
-CREATE INDEX IF NOT EXISTS idx_offers_to ON offers(to_user_id, status);
-CREATE INDEX IF NOT EXISTS idx_offers_from ON offers(from_user_id, status);
 
+-- trades: cash-mode, one-directional. Buyer pays at accept, seller sends ticket, buyer confirms receipt, escrow releases to seller.
 CREATE TABLE IF NOT EXISTS trades (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   offer_id INTEGER NOT NULL REFERENCES offers(id),
-  user_a_id INTEGER NOT NULL REFERENCES users(id),
-  user_b_id INTEGER NOT NULL REFERENCES users(id),
-  listing_a_id INTEGER NOT NULL REFERENCES listings(id),
-  listing_b_id INTEGER NOT NULL REFERENCES listings(id),
-  a_sent INTEGER DEFAULT 0,
-  b_sent INTEGER DEFAULT 0,
-  a_received INTEGER DEFAULT 0,
-  b_received INTEGER DEFAULT 0,
-  escrow_charge_a TEXT,
-  escrow_charge_b TEXT,
+  buyer_id INTEGER NOT NULL REFERENCES users(id),
+  seller_id INTEGER NOT NULL REFERENCES users(id),
+  listing_id INTEGER NOT NULL REFERENCES listings(id),
+  amount_cents INTEGER NOT NULL,
+  escrow_charge_id TEXT,
+  seller_sent INTEGER DEFAULT 0,
+  buyer_received INTEGER DEFAULT 0,
   status TEXT DEFAULT 'active', -- active | disputed | complete | cancelled
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   completed_at TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_trades_buyer ON trades(buyer_id, status);
+CREATE INDEX IF NOT EXISTS idx_trades_seller ON trades(seller_id, status);
 
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

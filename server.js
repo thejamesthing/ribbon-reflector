@@ -40,6 +40,22 @@ try {
   console.error('[migration] offers table check failed:', e.message);
 }
 
+// ===== ONE-TIME MIGRATION: swap-mode trades → cash-mode trades =====
+// The old `trades` table has `user_a_id`/`user_b_id`/`listing_a_id`/`listing_b_id` etc.
+// Detect and drop so schema.sql recreates it with buyer/seller shape.
+// REMOVE this block after confirming migration has run on all environments.
+try {
+  const cols = db.prepare("PRAGMA table_info(trades)").all();
+  const hasOldShape = cols.some(c => c.name === 'user_a_id');
+  const hasNewShape = cols.some(c => c.name === 'buyer_id');
+  if (hasOldShape && !hasNewShape) {
+    console.log('[migration] Dropping old swap-mode trades table. Existing trade rows will be lost.');
+    db.exec('DROP TABLE IF EXISTS trades;');
+  }
+} catch (e) {
+  console.error('[migration] trades table check failed:', e.message);
+}
+
 const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
 db.exec(schema);
 // ===== APP =====
