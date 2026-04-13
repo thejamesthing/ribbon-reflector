@@ -376,34 +376,59 @@ app.get('/api/trades/:id', authRequired, (req, res) => {
   res.json(trade);
 });
 
-function markTradeField(req, res, field) {
+// Cash-mode one-directional handoff:
+//   seller calls mark-sent → sets seller_sent=1
+//   buyer calls mark-received → sets buyer_received=1
+// When both are true, trade completes and escrow releases to seller (single payment row).
+app.post('/api/trades/:id/mark-sent', authRequired, (req, res) => {
   const trade = db.prepare('SELECT * FROM trades WHERE id=?').get(req.params.id);
   if (!trade) return res.status(404).json({ error: 'not found' });
   if (trade.status !== 'active') return res.status(400).json({ error: 'trade is ' + trade.status });
-  const side = trade.user_a_id === req.user.id ? 'a' : trade.user_b_id === req.user.id ? 'b' : null;
-  if (!side) return res.status(403).json({ error: 'not your trade' });
-  db.prepare(`UPDATE trades SET ${side}_${field}=1 WHERE id=?`).run(trade.id);
-  const after = db.prepare('SELECT * FROM trades WHERE id=?').get(trade.id);
+  if (trade.seller_id !== req.user.id) return res.status(403).json({ error: 'only the seller can mark sent' });
+  if (trade.seller_sent) return res.status(400).json({ error: 'already marked sent' });
 
-  // If both received, complete the trade and release escrow
-  if (field === 'received' && after.a_received && after.b_received) {
-    db.prepare(`UPDATE trades SET status='complete', completed_at=CURRENT_TIMESTAMP WHERE id=?`).run(trade.id);
-    // Release escrow — in real Stripe, this is capturing/transferring the held funds.
-    const a = db.prepare('SELECT * FROM payments WHERE trade_id=? AND user_id=? AND kind=?').get(trade.id, trade.user_a_id, 'escrow_hold');
-    const b = db.prepare('SELECT * FROM payments WHERE trade_id=? AND user_id=? AND kind=?').get(trade.id, trade.user_b_id, 'escrow_hold');
-    db.prepare(`INSERT INTO payments (user_id, kind, amount_cents, stripe_id, trade_id) VALUES (?, 'escrow_release', ?, ?, ?), (?, 'escrow_release', ?, ?, ?)`)
-      .run(trade.user_a_id, a.amount_cents, 'rel_' + a.stripe_id, trade.id,
-           trade.user_b_id, b.amount_cents, 'rel_' + b.stripe_id, trade.id);
-    notify(trade.user_a_id, '✓', 'Trade complete — escrow released. Leave a review!', 'reviews');
-    notify(trade.user_b_id, '✓', 'Trade complete — escrow released. Leave a review!', 'reviews');
-  } else {
-    const otherUser = side === 'a' ? trade.user_b_id : trade.user_a_id;
-    notify(otherUser, field === 'sent' ? '✈️' : '📬', `Partner marked tickets as ${field}.`, 'wallet');
+  db.prepare(`UPDATE trades SET seller_sent=1 WHERE id=?`).run(trade.id);
+  maybeCompleteTrade(trade.id);
+  const after = db.prepare('SELECT * FROM trades WHERE id=?').get(trade.id);
+  if (after.status === 'active') {
+    notify(trade.buyer_id, '✈️', 'Seller marked the ticket as sent. Confirm when you receive it.', 'wallet');
   }
   res.json(after);
+});
+
+app.post('/api/trades/:id/mark-received', authRequired, (req, res) => {
+  const trade = db.prepare('SELECT * FROM trades WHERE id=?').get(req.params.id);
+  if (!trade) return res.status(404).json({ error: 'not found' });
+  if (trade.status !== 'active') return res.status(400).json({ error: 'trade is ' + trade.status });
+  if (trade.buyer_id !== req.user.id) return res.status(403).json({ error: 'only the buyer can mark received' });
+  if (trade.buyer_received) return res.status(400).json({ error: 'already marked received' });
+  if (!trade.seller_sent) return res.status(400).json({ error: 'seller has not marked the ticket sent yet' });
+
+  db.prepare(`UPDATE trades SET buyer_received=1 WHERE id=?`).run(trade.id);
+  maybeCompleteTrade(trade.id);
+  const after = db.prepare('SELECT * FROM trades WHERE id=?').get(trade.id);
+  res.json(after);
+});
+
+// Finalize trade + release escrow to seller if both sides are marked.
+// Idempotent: safe to call repeatedly; only acts once when state transitions.
+function maybeCompleteTrade(tradeId) {
+  const t = db.prepare('SELECT * FROM trades WHERE id=?').get(tradeId);
+  if (!t || t.status !== 'active') return;
+  if (!t.seller_sent || !t.buyer_received) return;
+
+  const tx = db.transaction(() => {
+    db.prepare(`UPDATE trades SET status='complete', completed_at=CURRENT_TIMESTAMP WHERE id=?`).run(t.id);
+    const hold = db.prepare(`SELECT * FROM payments WHERE trade_id=? AND kind='escrow_hold'`).get(t.id);
+    const releaseStripeId = hold ? 'rel_' + hold.stripe_id : 'rel_unknown_' + t.id;
+    db.prepare(`INSERT INTO payments (user_id, kind, amount_cents, stripe_id, trade_id) VALUES (?, 'escrow_release', ?, ?, ?)`)
+      .run(t.seller_id, t.amount_cents, releaseStripeId, t.id);
+  });
+  tx();
+
+  notify(t.buyer_id,  '✓', 'Trade complete — enjoy the show! Leave a review when you can.', 'reviews');
+  notify(t.seller_id, '✓', 'Trade complete — escrow released to you. Leave a review for the buyer.', 'reviews');
 }
-app.post('/api/trades/:id/mark-sent',     authRequired, (req,res)=>markTradeField(req,res,'sent'));
-app.post('/api/trades/:id/mark-received', authRequired, (req,res)=>markTradeField(req,res,'received'));
 
 // ===== MESSAGES =====
 app.get('/api/trades/:id/messages', authRequired, (req, res) => {
