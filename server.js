@@ -615,8 +615,12 @@ app.post('/api/checkout/membership', authRequired, (req, res) => {
 app.get('/api/listings', (req, res) => {
   const { q, city, max_price, sort, owner } = req.query;
   // When querying a specific owner, show all their listings (including pending/traded)
+  // For owner queries we include active trade info so the seller can click straight through to their wallet.
   let sql = owner
-    ? `SELECT l.*, u.handle AS owner_handle FROM listings l JOIN users u ON u.id = l.owner_id WHERE 1=1`
+    ? `SELECT l.*, u.handle AS owner_handle,
+         (SELECT t.id FROM trades t WHERE t.listing_id=l.id AND t.status!='canceled' ORDER BY t.id DESC LIMIT 1) AS active_trade_id,
+         (SELECT t.payment_status FROM trades t WHERE t.listing_id=l.id AND t.status!='canceled' ORDER BY t.id DESC LIMIT 1) AS active_trade_payment_status
+         FROM listings l JOIN users u ON u.id = l.owner_id WHERE 1=1`
     : `SELECT l.*, u.handle AS owner_handle FROM listings l JOIN users u ON u.id = l.owner_id WHERE l.status = 'active'`;
   const params = [];
   if (q)         { sql += ' AND (l.artist LIKE ? OR l.venue LIKE ? OR l.city LIKE ?)'; const p = `%${q}%`; params.push(p,p,p); }
