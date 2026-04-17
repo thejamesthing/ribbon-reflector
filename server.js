@@ -1042,10 +1042,15 @@ async function maybeCompleteTrade(tradeId) {
 
   if (stripe && seller?.stripe_account_id && t.payment_intent_id) {
     try {
+      // Retrieve the charge ID from the PaymentIntent so we can tie the transfer to it.
+      // This avoids the 'insufficient available funds' error by drawing from the specific charge.
+      const pi = await stripe.paymentIntents.retrieve(t.payment_intent_id);
+      const chargeId = pi.latest_charge;
       const transfer = await stripe.transfers.create({
         amount: t.amount_cents,
         currency: 'usd',
         destination: seller.stripe_account_id,
+        source_transaction: chargeId,
         transfer_group: `trade_${t.id}`,
         metadata: {
           rr_trade_id: String(t.id),
