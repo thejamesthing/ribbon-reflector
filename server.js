@@ -129,6 +129,14 @@ db.exec(schema);
     }
   }
 }
+// ===== TRANSFER COLUMN MIGRATION (Phase 3) =====
+{
+  const have = new Set(db.prepare("PRAGMA table_info(trades)").all().map(c => c.name));
+  if (!have.has('transfer_id')) {
+    console.log('[migration] trades: adding column transfer_id');
+    db.exec(`ALTER TABLE trades ADD COLUMN transfer_id TEXT`);
+  }
+}
 // ===== APP =====
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -979,7 +987,7 @@ app.get('/api/trades/:id', authRequired, async (req, res) => {
 //   seller calls mark-sent → sets seller_sent=1
 //   buyer calls mark-received → sets buyer_received=1
 // When both are true, trade completes and escrow releases to seller (single payment row).
-app.post('/api/trades/:id/mark-sent', authRequired, paidRequired, (req, res) => {
+app.post('/api/trades/:id/mark-sent', authRequired, paidRequired, async (req, res) => {
   const trade = db.prepare('SELECT * FROM trades WHERE id=?').get(req.params.id);
   if (!trade) return res.status(404).json({ error: 'not found' });
   if (trade.status !== 'active') return res.status(400).json({ error: 'trade is ' + trade.status });
@@ -987,7 +995,7 @@ app.post('/api/trades/:id/mark-sent', authRequired, paidRequired, (req, res) => 
   if (trade.seller_sent) return res.status(400).json({ error: 'already marked sent' });
 
   db.prepare(`UPDATE trades SET seller_sent=1 WHERE id=?`).run(trade.id);
-  maybeCompleteTrade(trade.id);
+  await maybeCompleteTrade(trade.id);
   const after = db.prepare('SELECT * FROM trades WHERE id=?').get(trade.id);
   if (after.status === 'active') {
     notify(trade.buyer_id, '✈️', 'Seller marked the ticket as sent. Confirm when you receive it.', 'wallet');
@@ -1005,7 +1013,7 @@ app.post('/api/trades/:id/mark-sent', authRequired, paidRequired, (req, res) => 
   res.json(after);
 });
 
-app.post('/api/trades/:id/mark-received', authRequired, (req, res) => {
+app.post('/api/trades/:id/mark-received', authRequired, async (req, res) => {
   const trade = db.prepare('SELECT * FROM trades WHERE id=?').get(req.params.id);
   if (!trade) return res.status(404).json({ error: 'not found' });
   if (trade.status !== 'active') return res.status(400).json({ error: 'trade is ' + trade.status });
@@ -1014,22 +1022,51 @@ app.post('/api/trades/:id/mark-received', authRequired, (req, res) => {
   if (!trade.seller_sent) return res.status(400).json({ error: 'seller has not marked the ticket sent yet' });
 
   db.prepare(`UPDATE trades SET buyer_received=1 WHERE id=?`).run(trade.id);
-  maybeCompleteTrade(trade.id);
+  await maybeCompleteTrade(trade.id);
   const after = db.prepare('SELECT * FROM trades WHERE id=?').get(trade.id);
   res.json(after);
 });
 
 // Finalize trade + release escrow to seller if both sides are marked.
 // Idempotent: safe to call repeatedly; only acts once when state transitions.
-function maybeCompleteTrade(tradeId) {
+// Phase 3: creates a real Stripe Transfer from platform → seller's connected account.
+async function maybeCompleteTrade(tradeId) {
   const t = db.prepare('SELECT * FROM trades WHERE id=?').get(tradeId);
   if (!t || t.status !== 'active') return;
   if (!t.seller_sent || !t.buyer_received) return;
 
+  // Look up seller's Stripe account. If missing, still complete the trade but log the error
+  // — admin will need to handle the payout manually.
+  const seller = db.prepare('SELECT stripe_account_id FROM users WHERE id=?').get(t.seller_id);
+  let transferId = null;
+
+  if (stripe && seller?.stripe_account_id && t.payment_intent_id) {
+    try {
+      const transfer = await stripe.transfers.create({
+        amount: t.amount_cents,
+        currency: 'usd',
+        destination: seller.stripe_account_id,
+        transfer_group: `trade_${t.id}`,
+        metadata: {
+          rr_trade_id: String(t.id),
+          rr_seller_id: String(t.seller_id),
+          rr_buyer_id: String(t.buyer_id),
+        },
+      });
+      transferId = transfer.id;
+      console.log(`[transfer] trade ${t.id}: ${transfer.id} → ${seller.stripe_account_id} ($${(t.amount_cents/100).toFixed(2)})`);
+    } catch (e) {
+      // Log but don't block trade completion — admin resolves manually.
+      console.error(`[transfer] trade ${t.id} FAILED:`, e.message);
+    }
+  } else {
+    console.warn(`[transfer] trade ${t.id}: skipped — stripe=${!!stripe}, seller_acct=${seller?.stripe_account_id}, pi=${t.payment_intent_id}`);
+  }
+
   const tx = db.transaction(() => {
-    db.prepare(`UPDATE trades SET status='complete', completed_at=CURRENT_TIMESTAMP WHERE id=?`).run(t.id);
+    db.prepare(`UPDATE trades SET status='complete', completed_at=CURRENT_TIMESTAMP, transfer_id=? WHERE id=?`).run(transferId, t.id);
     const hold = db.prepare(`SELECT * FROM payments WHERE trade_id=? AND kind='escrow_hold'`).get(t.id);
-    const releaseStripeId = hold ? 'rel_' + hold.stripe_id : 'rel_unknown_' + t.id;
+    const releaseStripeId = transferId || (hold ? 'rel_' + hold.stripe_id : 'rel_unknown_' + t.id);
     db.prepare(`INSERT INTO payments (user_id, kind, amount_cents, stripe_id, trade_id) VALUES (?, 'escrow_release', ?, ?, ?)`)
       .run(t.seller_id, t.amount_cents, releaseStripeId, t.id);
   });
