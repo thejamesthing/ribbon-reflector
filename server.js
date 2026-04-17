@@ -109,6 +109,14 @@ db.exec(schema);
     }
   }
 }
+// ===== ADMIN COLUMN MIGRATION =====
+{
+  const have = new Set(db.prepare("PRAGMA table_info(users)").all().map(c => c.name));
+  if (!have.has('is_admin')) {
+    console.log('[migration] users: adding column is_admin');
+    db.exec("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0");
+  }
+}
 // ===== PAYMENT INTENT COLUMN MIGRATION (Phase 2) =====
 // payment_status lifecycle:
 //   'pending'  → PI authorized, buyer hasn't paid yet
@@ -256,13 +264,17 @@ function authRequired(req, res, next) {
   if (!token) return res.status(401).json({ error: 'not authenticated' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT id, handle, email, is_member, member_until, bio, avatar_data_url, link, city, region, email_verified, email_verification_sent_at, stripe_account_id, stripe_account_status FROM users WHERE id = ?').get(payload.userId);
+    const user = db.prepare('SELECT id, handle, email, is_member, member_until, bio, avatar_data_url, link, city, region, email_verified, email_verification_sent_at, stripe_account_id, stripe_account_status, is_admin FROM users WHERE id = ?').get(payload.userId);
     if (!user) return res.status(401).json({ error: 'user not found' });
     req.user = user;
     next();
   } catch (e) {
     return res.status(401).json({ error: 'invalid token' });
   }
+}
+function adminRequired(req, res, next) {
+  if (!req.user.is_admin) return res.status(403).json({ error: 'admin access required' });
+  next();
 }
 function memberRequired(req, res, next) {
   if (!req.user.is_member) return res.status(402).json({ error: 'membership required', upgrade: '/api/checkout/membership' });
@@ -1379,6 +1391,101 @@ app.delete('/api/me', authRequired, async (req, res) => {
     console.error('[account-deletion] failed:', e.message);
     res.status(500).json({ error: 'could not delete account: ' + e.message });
   }
+});
+
+// ===== ADMIN PANEL =====
+// All admin endpoints require auth + admin role.
+app.get('/api/admin/stats', authRequired, adminRequired, (req, res) => {
+  const userCount = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
+  const listingCount = db.prepare('SELECT COUNT(*) AS n FROM listings').get().n;
+  const activeListings = db.prepare("SELECT COUNT(*) AS n FROM listings WHERE status='active'").get().n;
+  const tradeCount = db.prepare('SELECT COUNT(*) AS n FROM trades').get().n;
+  const completedTrades = db.prepare("SELECT COUNT(*) AS n FROM trades WHERE status='complete'").get().n;
+  const totalVolume = db.prepare("SELECT COALESCE(SUM(amount_cents),0) AS n FROM trades WHERE status='complete'").get().n;
+  res.json({ userCount, listingCount, activeListings, tradeCount, completedTrades, totalVolumeCents: totalVolume });
+});
+
+app.get('/api/admin/users', authRequired, adminRequired, (req, res) => {
+  const users = db.prepare(`SELECT id, handle, email, is_member, member_until, is_admin,
+    email_verified, stripe_account_status, created_at,
+    (SELECT COUNT(*) FROM listings WHERE owner_id=users.id) AS listing_count,
+    (SELECT COUNT(*) FROM trades WHERE buyer_id=users.id OR seller_id=users.id) AS trade_count
+    FROM users ORDER BY id DESC`).all();
+  res.json(users);
+});
+
+app.get('/api/admin/listings', authRequired, adminRequired, (req, res) => {
+  const listings = db.prepare(`SELECT l.*, u.handle AS owner_handle
+    FROM listings l JOIN users u ON u.id = l.owner_id
+    ORDER BY l.id DESC`).all();
+  res.json(listings);
+});
+
+app.get('/api/admin/trades', authRequired, adminRequired, (req, res) => {
+  const trades = db.prepare(`SELECT t.*,
+    b.handle AS buyer_handle, s.handle AS seller_handle,
+    l.artist, l.venue
+    FROM trades t
+    JOIN users b ON b.id = t.buyer_id
+    JOIN users s ON s.id = t.seller_id
+    JOIN listings l ON l.id = t.listing_id
+    ORDER BY t.id DESC`).all();
+  res.json(trades);
+});
+
+// Admin actions
+app.delete('/api/admin/users/:id', authRequired, adminRequired, (req, res) => {
+  const targetId = parseInt(req.params.id);
+  if (targetId === req.user.id) return res.status(400).json({ error: 'cannot delete yourself' });
+  const target = db.prepare('SELECT handle FROM users WHERE id=?').get(targetId);
+  if (!target) return res.status(404).json({ error: 'user not found' });
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM notifications WHERE user_id=?').run(targetId);
+    db.prepare('DELETE FROM reviews WHERE author_id=? OR subject_id=?').run(targetId, targetId);
+    db.prepare('DELETE FROM friendships WHERE requester_id=? OR recipient_id=?').run(targetId, targetId);
+    db.prepare('DELETE FROM messages WHERE sender_id=?').run(targetId);
+    db.prepare('DELETE FROM offers WHERE from_user_id=? OR to_user_id=?').run(targetId, targetId);
+    db.prepare('DELETE FROM listings WHERE owner_id=?').run(targetId);
+    db.prepare('DELETE FROM payments WHERE user_id=?').run(targetId);
+    db.prepare('DELETE FROM users WHERE id=?').run(targetId);
+  });
+  tx();
+  console.log('[admin] deleted user', targetId, target.handle, 'by admin', req.user.handle);
+  res.json({ ok: true, deleted: target.handle });
+});
+
+app.delete('/api/admin/listings/:id', authRequired, adminRequired, (req, res) => {
+  const id = parseInt(req.params.id);
+  const listing = db.prepare('SELECT * FROM listings WHERE id=?').get(id);
+  if (!listing) return res.status(404).json({ error: 'listing not found' });
+  db.prepare('DELETE FROM listings WHERE id=?').run(id);
+  console.log('[admin] deleted listing', id, 'by admin', req.user.handle);
+  res.json({ ok: true });
+});
+
+app.post('/api/admin/users/:id/promote', authRequired, adminRequired, (req, res) => {
+  const id = parseInt(req.params.id);
+  db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(id);
+  const u = db.prepare('SELECT handle FROM users WHERE id=?').get(id);
+  console.log('[admin] promoted', u?.handle, 'to admin by', req.user.handle);
+  res.json({ ok: true });
+});
+
+app.post('/api/admin/users/:id/demote', authRequired, adminRequired, (req, res) => {
+  const id = parseInt(req.params.id);
+  if (id === req.user.id) return res.status(400).json({ error: 'cannot demote yourself' });
+  db.prepare('UPDATE users SET is_admin=0 WHERE id=?').run(id);
+  res.json({ ok: true });
+});
+
+app.post('/api/admin/listings/:id/approve', authRequired, adminRequired, (req, res) => {
+  db.prepare("UPDATE listings SET status='active' WHERE id=?").run(parseInt(req.params.id));
+  res.json({ ok: true });
+});
+
+app.post('/api/admin/listings/:id/reject', authRequired, adminRequired, (req, res) => {
+  db.prepare("UPDATE listings SET status='rejected' WHERE id=?").run(parseInt(req.params.id));
+  res.json({ ok: true });
 });
 
 // ===== HEALTH =====
