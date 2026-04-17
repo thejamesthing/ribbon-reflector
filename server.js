@@ -480,8 +480,8 @@ app.post('/api/auth/signup', async (req, res) => {
   try {
     const hash = bcrypt.hashSync(password, 10);
     verificationToken = crypto.randomBytes(32).toString('hex');
-    const result = db.prepare(`INSERT INTO users (handle, email, password_hash, bio, email_verification_token, email_verification_sent_at)
-      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`)
+    const result = db.prepare(`INSERT INTO users (handle, email, password_hash, bio, email_verification_token, email_verification_sent_at, is_member, member_until)
+      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1, '2099-12-31')`)
       .run(normHandle, email, hash, bio || '', verificationToken);
     userId = result.lastInsertRowid;
   } catch (e) {
@@ -492,7 +492,7 @@ app.post('/api/auth/signup', async (req, res) => {
   try { await sendVerificationEmail({ handle: normHandle, email }, verificationToken); }
   catch (e) { console.error('[signup] verification email failed:', e.message); }
   const token = makeToken(userId);
-  res.json({ id: userId, handle: normHandle, email, is_member: 0, email_verified: 0, token });
+  res.json({ id: userId, handle: normHandle, email, is_member: 1, email_verified: 0, token });
 });
 
 // Confirm ownership of the email address via the token sent at signup.
