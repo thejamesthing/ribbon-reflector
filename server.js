@@ -215,6 +215,8 @@ app.use('/api/auth/', rateLimit({
 }));
 
 const ALLOWED_ORIGINS = [
+  'https://ribbonreflector.com',
+  'https://www.ribbonreflector.com',
   'https://ribbon-reflector-frontend.vercel.app',
 ];
 app.use(cors({
