@@ -481,7 +481,7 @@ app.post('/api/auth/signup', async (req, res) => {
     const hash = bcrypt.hashSync(password, 10);
     verificationToken = crypto.randomBytes(32).toString('hex');
     const result = db.prepare(`INSERT INTO users (handle, email, password_hash, bio, email_verification_token, email_verification_sent_at, is_member, member_until)
-      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1, '2099-12-31')`)
+      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1, date('now', '+1 year'))`)
       .run(normHandle, email, hash, bio || '', verificationToken);
     userId = result.lastInsertRowid;
   } catch (e) {
