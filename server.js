@@ -139,17 +139,91 @@ db.exec(schema);
 }
 // ===== APP =====
 const app = express();
+// Stripe webhook needs the raw body for signature verification — must be registered
+// BEFORE express.json() parses it. All other routes use parsed JSON as usual.
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!STRIPE_WEBHOOK_SECRET || !stripe) return res.status(503).send('webhook not configured');
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
+  } catch (e) {
+    console.error('[webhook] signature verification failed:', e.message);
+    return res.status(400).send('invalid signature');
+  }
+  console.log(`[webhook] ${event.type} id=${event.id}`);
+  try {
+    switch (event.type) {
+      case 'account.updated': {
+        const acct = event.data.object;
+        const status = deriveStripeStatus(acct);
+        db.prepare('UPDATE users SET stripe_account_status=? WHERE stripe_account_id=?').run(status, acct.id);
+        console.log(`[webhook] account ${acct.id} → ${status}`);
+        break;
+      }
+      case 'charge.dispute.created': {
+        const dispute = event.data.object;
+        const pi_id = dispute.payment_intent;
+        if (pi_id) {
+          const trade = db.prepare('SELECT * FROM trades WHERE payment_intent_id=?').get(pi_id);
+          if (trade && trade.status === 'active') {
+            db.prepare(`UPDATE trades SET status='disputed' WHERE id=?`).run(trade.id);
+            notify(trade.buyer_id,  '⚠️', `Card dispute opened on trade #${trade.id}. Escrow paused.`, 'wallet');
+            notify(trade.seller_id, '⚠️', `Card dispute opened on trade #${trade.id}. Escrow paused.`, 'wallet');
+            console.log(`[webhook] trade ${trade.id} auto-disputed from charge dispute`);
+          }
+        }
+        break;
+      }
+      case 'payment_intent.payment_failed': {
+        const pi = event.data.object;
+        const trade = db.prepare('SELECT * FROM trades WHERE payment_intent_id=?').get(pi.id);
+        if (trade && trade.payment_status === 'pending') {
+          db.prepare(`UPDATE trades SET payment_status='failed' WHERE id=?`).run(trade.id);
+          console.log(`[webhook] trade ${trade.id} payment failed`);
+        }
+        break;
+      }
+      // payment_intent.succeeded, transfer.created, charge.refunded — logged for observability
+      default:
+        break;
+    }
+  } catch (e) {
+    console.error('[webhook] handler error:', e.message);
+  }
+  res.json({ received: true });
+});
+
 app.use(express.json({ limit: '5mb' }));
 app.use(cookieParser());
+
+// Rate limiting — generous for beta; tighten later.
+const rateLimit = require('express-rate-limit');
+app.use('/api/', rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 60,             // 60 requests per minute per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too many requests — please slow down' },
+}));
+// Tighter limit on auth endpoints to prevent brute force.
+app.use('/api/auth/', rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 15,                   // 15 attempts per 15 min per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too many attempts — try again in a few minutes' },
+}));
+
 const ALLOWED_ORIGINS = [
   'https://ribbon-reflector-frontend.vercel.app',
-  'http://localhost:3000',
-  'http://localhost:5173',
 ];
 app.use(cors({
   origin: (origin, cb) => {
-    // Allow same-origin/server-to-server (no origin header) and any vercel preview deployments
-    if (!origin || ALLOWED_ORIGINS.includes(origin) || /^https:\/\/ribbon-reflector-frontend.*\.vercel\.app$/.test(origin)) {
+    // Allow same-origin/server-to-server (no origin header) and the production frontend.
+    // In development, also allow localhost.
+    if (!origin || ALLOWED_ORIGINS.includes(origin)
+      || /^https:\/\/ribbon-reflector-frontend.*\.vercel\.app$/.test(origin)
+      || /^http:\/\/localhost(:\d+)?$/.test(origin)) {
       return cb(null, true);
     }
     cb(new Error('Not allowed by CORS: ' + origin));
@@ -845,7 +919,7 @@ app.post('/api/offers/:id/accept', authRequired, verifiedRequired, payoutsRequir
     return res.status(500).json({ error: 'could not create payment: ' + e.message });
   }
 
-  const paymentWindowExpiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+  const paymentWindowExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // 24-hour window during beta
   db.prepare(`UPDATE trades SET payment_intent_id=?, payment_client_secret=?, payment_window_expires_at=? WHERE id=?`)
     .run(pi.id, pi.client_secret, paymentWindowExpiresAt, tradeId);
   notify(buyerId,  '🎉', `<strong>${req.user.handle}</strong> accepted your ${amountDisplay} offer for ${listing.artist}!`, 'wallet');
@@ -1262,6 +1336,47 @@ app.post('/api/dev/delete-user', (req, res) => {
   if (!email) return res.status(400).json({ error: 'email required' });
   const result = db.prepare('DELETE FROM users WHERE email = ?').run(email);
   res.json({ deleted: result.changes });
+});
+
+// ===== ACCOUNT DELETION =====
+// Cascading delete: removes user + their listings, offers, trades (orphaned),
+// reviews, notifications, friendships. Respects foreign key cascades if schema has them,
+// otherwise does explicit cleanup.
+app.delete('/api/me', authRequired, async (req, res) => {
+  const userId = req.user.id;
+  const handle = req.user.handle;
+  try {
+    const tx = db.transaction(() => {
+      // Cancel any active trades where this user is a party (buyer or seller).
+      const activeTrades = db.prepare(`SELECT * FROM trades WHERE (buyer_id=? OR seller_id=?) AND status='active'`).all(userId, userId);
+      for (const t of activeTrades) {
+        db.prepare(`UPDATE trades SET status='canceled' WHERE id=?`).run(t.id);
+        db.prepare(`UPDATE listings SET status='active' WHERE id=?`).run(t.listing_id);
+        // Void any pending Stripe PaymentIntents.
+        if (stripe && t.payment_intent_id && t.payment_status === 'pending') {
+          stripe.paymentIntents.cancel(t.payment_intent_id).catch(e =>
+            console.error(`[delete-user] PI cancel failed for trade ${t.id}:`, e.message));
+        }
+      }
+      // Remove user's data.
+      db.prepare('DELETE FROM notifications WHERE user_id=?').run(userId);
+      db.prepare('DELETE FROM reviews WHERE author_id=? OR subject_id=?').run(userId, userId);
+      db.prepare('DELETE FROM friendships WHERE requester_id=? OR recipient_id=?').run(userId, userId);
+      db.prepare('DELETE FROM messages WHERE sender_id=?').run(userId);
+      db.prepare('DELETE FROM offers WHERE from_user_id=? OR to_user_id=?').run(userId, userId);
+      db.prepare('DELETE FROM listings WHERE owner_id=?').run(userId);
+      db.prepare('DELETE FROM disputes WHERE filed_by_id=?').run(userId);
+      db.prepare('DELETE FROM payments WHERE user_id=?').run(userId);
+      db.prepare('DELETE FROM users WHERE id=?').run(userId);
+    });
+    tx();
+    console.log(`[account-deletion] user ${userId} (${handle}) deleted`);
+    res.clearCookie('rr_token');
+    res.json({ ok: true, deleted: handle });
+  } catch (e) {
+    console.error('[account-deletion] failed:', e.message);
+    res.status(500).json({ error: 'could not delete account: ' + e.message });
+  }
 });
 
 // ===== HEALTH =====
